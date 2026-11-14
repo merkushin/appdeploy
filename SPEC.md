@@ -758,8 +758,9 @@ published. The binaries are built with the matching public key and the repositor
 **One-time setup, by the owner of the repository.**
 `go run ./cmd/releasetool keygen -out release.key` writes the private key (mode 0600,
 never overwrites) and prints the public key. Store the private key as the repository
-secret `RELEASE_SIGNING_KEY` and keep a backup; store the public key as the repository
-variable `RELEASE_PUBLIC_KEY`. `.gitignore` excludes `*.key` and `dist/`.
+secret `RELEASE_SIGNING_KEY` and keep a backup. That is all: the public key built into the
+binaries is derived from the secret (`scripts/release.sh` accepts `RELEASE_PUBLIC_KEY` only
+as a cross-check). `.gitignore` excludes `*.key` and `dist/`.
 
 **Updating.** `appdeploy self-update [--check] [--force] [--repo owner/name]` (admin; over
 SSH as `appdeploy --host deploy@server self-update`) asks the agent, which runs as root:
@@ -786,6 +787,47 @@ protected environment with required reviewers for that secret narrows it further
 no key rotation: a new key means a release of binaries that embed it, which servers accept
 only if it is still signed with the old key, and that migration is not automated.
 
-**Not done:** updating a whole group from one command (run it on each server), the install
-script downloading the latest release itself (it still takes `--binary`), a release
-channel other than "latest", and `--check` notifications.
+**Updating a whole group.** `appdeploy group set-version v1.3.0` on the founder (`none` to
+clear) records the wanted release in the group's replicated state, next to the member list.
+Every member compares it with its own version every `--update-check-every` (default 1m) and
+installs it when it is its turn (`update.Decide`):
+
+- servers go in name order, so the first is a canary; a server waits until every *reachable*
+  server before it runs the wanted version or a newer one (an unreachable one is not waited
+  for, a reachable one that stays on the old version stops everyone behind it);
+- nobody installs while any reachable server has a deploy in progress, which includes the
+  observation window after a switch, and a server never installs while it is deploying;
+- a version is only ever installed upward; a development build is not managed;
+- a server that failed to run the wanted version (below) does not try it again until
+  another version is wanted.
+
+Each server verifies the release itself (signature, hash, a trial run), so the founder is
+not trusted with the binaries. `appdeploy group servers` shows the wanted version and the
+version, state and deploy activity of every server. An agent restart interrupts nothing but
+the agent: containers and traffic stay as they are, and a deploy that happens to start in
+that second resumes after the restart.
+
+**Reverting a bad update.** Before the new binary is put in place, a marker
+(`update-pending.json` in the data directory) is written. The service runs
+`appdeploy recover` before every start (`ExecStartPre`, in the unit the install script
+writes; it never blocks a start). It counts the starts of an unconfirmed version, and on
+the fourth start puts the old binary (`appdeploy.previous`) back, keeps the bad one as
+`appdeploy.failed`, writes `update-failed.json` and clears the marker. An agent that has
+been healthy for `--update-confirm-after` (default 1m, answering its own socket) confirms
+the update and clears the marker. The unit also has `StartLimitIntervalSec=0`, otherwise
+systemd would stop restarting before `recover` could revert. After a revert the agent sends
+`agent.update_failed` once. Manual `self-update` gets the same protection. What this cannot
+catch is a release that starts and runs but misbehaves; the group stops it from spreading
+when a server keeps reporting the old version, since the servers behind it wait. Servers
+installed before this feature need `install.sh` run again to get the new unit.
+
+**Protocol number.** Servers report a protocol number (`group.Protocol`, 1) and the
+coordinator of a deploy refuses to roll out to a server that reports another one, also with
+`allow_partial`, since it is reachable but incompatible. Bump it when a change to the peer
+API is not backward compatible; while it is the same, differing versions interoperate
+(unknown JSON fields are ignored).
+
+**Not done:** updating automatically to new patch releases (it is always an explicit
+`set-version`), the install script downloading the latest release itself (it still takes
+`--binary`), a release channel other than the one named, `--check` notifications, and
+reverting a version that runs but misbehaves.

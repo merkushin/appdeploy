@@ -57,7 +57,12 @@ A tag `vX.Y.Z` builds, signs and publishes binaries on GitHub (SPEC.md §27). Se
 themselves: `appdeploy --host deploy@server self-update` installs the latest release if
 its signature matches the key built into the running binary; the agent restarts into it and
 keeps the apps running. Setting up the signing key is a one-time step described in
-`.github/workflows/release.yml`.
+`.github/workflows/release.yml` (one repository secret, `RELEASE_SIGNING_KEY`).
+
+A whole group updates itself from one command on the founder: `appdeploy group set-version
+v1.3.0`. Servers install it one at a time in name order, waiting while anything is deploying;
+a version that fails to start is reverted automatically. `appdeploy group servers` shows
+progress.
 
 ## Development
 
