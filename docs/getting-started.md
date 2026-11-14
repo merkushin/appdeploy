@@ -36,9 +36,23 @@ Read `install.sh` before you run it; it runs as root. For your **own computer** 
 matching binary (`appdeploy-darwin-arm64`, `appdeploy-darwin-amd64` or `appdeploy-linux-arm64`),
 rename it to `appdeploy` and put it on your `PATH`.
 
-Releases are signed. The binary verifies the signature of later releases itself
-(`appdeploy self-update`), but the very first download is trusted only as far as GitHub and the
-checksum file are.
+**Check where it came from.** The checksum only proves the download is intact. Each release binary
+also carries a build attestation: proof that it was built by this repository's release workflow
+and not uploaded from somewhere else. Verify it with the GitHub CLI:
+
+```bash
+gh attestation verify appdeploy-linux-amd64 --repo merkushin/appdeploy
+```
+
+(Releases made before attestations were added, up to v0.1.1, do not have one.) The release notes
+also print the fingerprint of the key the binary will trust for updates. After installing, compare:
+
+```bash
+appdeploy version --verbose      # shows the release key and its fingerprint
+```
+
+From then on, `appdeploy self-update` accepts only releases signed with that key, so the first
+download is the one you verify by hand.
 
 ## 2. Install on the server
 
@@ -80,8 +94,9 @@ appdeploy runs your app as a container built from your Dockerfile, and needs thr
    `roles.web.healthcheck.path`.
 
 Also good to know: stop cleanly on `SIGTERM` (you get 30 seconds, `roles.web.stop_timeout`),
-keep state in a database, not in the container (apps get **no persistent volumes**), and read
-configuration from environment variables. A minimal example is in
+keep state in a database or in a named volume (`roles.<name>.volumes`), not in the container's
+own file system, and read configuration from environment variables (`env:` in `appdeploy.yml`
+for the ones that are not secret). A minimal example is in
 [`examples/hello`](../examples/hello).
 
 ## 4. Create the app and deploy

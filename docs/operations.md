@@ -75,7 +75,9 @@ server, for example with a nightly job on another machine:
 rsync -a --delete root@my-server:/var/lib/appdeploy/backups/ /backups/appdeploy/
 ```
 
-`apps destroy` keeps an app's database and backups on purpose.
+`apps destroy` keeps an app's database and backups on purpose, and its volumes too (`--delete-volumes`
+removes them). **Volumes are not backed up**: copy them off the server, for example with
+`docker run --rm -v ad-APP-NAME:/from:ro -v $PWD:/to alpine tar -C /from -czf /to/APP-NAME.tgz .`.
 
 ## Notifications
 
@@ -130,7 +132,9 @@ logs because they carry secrets.
 
 ## Updating appdeploy
 
-Releases are published on GitHub, signed with a key whose public half is built into every binary.
+Releases are published on GitHub, signed with a key whose public half is built into every binary
+(`appdeploy version --verbose` shows it and its fingerprint, which the release notes repeat).
+Each binary also has a build attestation: `gh attestation verify <file> --repo merkushin/appdeploy`.
 
 ```bash
 appdeploy --host deploy@my-server self-update --check     # is there a newer release

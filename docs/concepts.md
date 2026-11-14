@@ -94,9 +94,10 @@ releases and the deploy journal, the git repositories, secrets (mode 0600) and b
 
 ## Where appdeploy has opinions
 
-- Containers are stateless: **no volumes for your app.** Persistent data belongs in Postgres,
-  Redis or an external service. appdeploy can run Postgres and Redis for you
-  (`services:`), with backups.
+- Containers are disposable. Persistent data belongs in Postgres, Redis (appdeploy can run both
+  for you, with backups) or an external service; files that must survive can go in a **named
+  volume** (`roles.<name>.volumes`), which is not backed up and is shared by the old and the new
+  release until the watch window ends.
 - You provide a Dockerfile. appdeploy never guesses a build.
 - One web port per app, one proxy per server. Spreading traffic across several servers is up to
   a load balancer in front; each server answers `GET /health/<app>` for it.

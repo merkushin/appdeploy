@@ -70,6 +70,8 @@ notify: [https://hooks.slack.com/services/...]
 | `roles.<name>.healthcheck.start_period` | `60s` | How long a new container has to become healthy. |
 | `roles.<name>.smoke` | none | Extra paths (starting with `/`) that must answer below 500 before the switch. |
 | `roles.<name>.stop_timeout` | `30s` | Time to finish in-flight work after `SIGTERM` before the container is killed. |
+| `env` | none | A map of non-secret environment variables for every container, kept in git. Names are letters, digits and `_`; `PORT` and `APPDEPLOY_*` are reserved; values are single-line. Secrets with the same name win. Do not put secrets here: `appdeploy check` warns about names that look like one. |
+| `roles.<name>.volumes` | none | Named volumes to mount, as `name:/absolute/path[:ro]`. The name is lowercase letters, digits, `-` and `_`; host directories are not supported. The Docker volume is `ad-<app>-<name>` (with the default `--instance`), is created on the first deploy, is shared by every release and is never removed by a deploy. Not backed up by appdeploy. |
 | `release_command` | none | Run once per deploy before traffic moves, in a throwaway container of the new image with the release's environment. Like `cmd` it replaces the image's `CMD`. A failure stops the deploy. |
 | `services.postgres` | `false` | A database for this app on the server's shared Postgres; provides `DATABASE_URL`. |
 | `services.redis` | `false` | A Redis database number on the shared Redis; provides `REDIS_URL`. |
@@ -86,7 +88,7 @@ few seconds after start.
 
 ### The environment of your containers
 
-Every container gets the app's secrets, plus:
+Every container gets the `env` section of `appdeploy.yml`, then the app's secrets (a secret overrides an `env` entry of the same name), plus:
 
 | Variable | Value |
 |---|---|
@@ -94,6 +96,21 @@ Every container gets the app's secrets, plus:
 | `APPDEPLOY_APP`, `APPDEPLOY_RELEASE`, `APPDEPLOY_ROLE` | the app, the release number, the role name |
 | `APPDEPLOY_SERVER` | the server's name (in a group) |
 | `DATABASE_URL`, `REDIS_URL` | when `services` asks for them (a secret of the same name wins) |
+
+### Volumes
+
+A volume keeps files across deploys, rollbacks and restarts. Only **named volumes** are supported.
+Things to know:
+
+- During a deploy the old and the new container run at the same time, and both have the volume until
+  the old one stops, after `watch.window` (3 minutes by default). Files that must have one writer,
+  such as a SQLite database, are used by two processes meanwhile. SQLite copes with that in WAL mode,
+  but you may set `watch.window` lower. The deploy log prints a warning, and `appdeploy check`
+  warns when `replicas_per_server` is above 1 on a writable volume.
+- If the image declares `VOLUME /data` and the role does not mount something there, the deploy is
+  refused: Docker would use an anonymous volume that is deleted with the container.
+- `appdeploy apps destroy` keeps the volumes (use `--delete-volumes` to remove them).
+- Volumes live on one server. In a group, each server has its own copy of the data.
 
 ## Agent flags
 

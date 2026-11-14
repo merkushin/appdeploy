@@ -280,7 +280,7 @@ var phrases = []string{
 	"invalid or expired invite", "does not match the invite (wrong server?)",
 	"only the server that created the group can", "to update first",
 	"published a release", "signature of SHA256SUMS is not valid", "built without a release signing key",
-	"are in progress", "failed here before and was reverted", "superseded by",
+	"are in progress", "the image declares VOLUME", "failed here before and was reverted", "superseded by",
 }
 
 func goSources(t *testing.T) string {

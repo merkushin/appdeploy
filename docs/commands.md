@@ -14,6 +14,12 @@ appdeploy [--host user@host] [--socket path] <command> [arguments]
   read-only commands, a *deployer* adds deploy, rollback and logs, an *admin* can run everything.
   The tables below say which. See [Operations: security](operations.md#security).
 
+- **`--json`** (anywhere before a `--`) prints JSON instead of text, for scripts and AI assistants:
+  one line per object or list; for a deploy one JSON line per journal entry, the last being
+  `{"done":true,"state":"succeeded","error":""}`; errors as `{"error":"message"}` on stdout. It works
+  over `--host` and for every role. Fields are those of the [HTTP API](api.md). Commands that print
+  free text (`logs`, `exec`) ignore it.
+
 Most commands that change something stream the agent's journal until the deploy ends, so you
 see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continues on the server**
 (its id is printed so you can look it up).
@@ -23,6 +29,8 @@ see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continu
 | Command | Role | |
 |---|---|---|
 | [`appdeploy ping`](#appdeploy-ping) | viewer | is the agent up |
+| [`appdeploy check`](#appdeploy-check) | local | validate an `appdeploy.yml` |
+| [`appdeploy import kamal`](#appdeploy-import-kamal) | local | turn a Kamal setup into appdeploy's |
 | [`appdeploy status`](#appdeploy-status) | viewer | what runs |
 | [`appdeploy apps list`](#appdeploy-apps-list) | viewer | all apps |
 | [`appdeploy releases`](#appdeploy-releases) | viewer | releases of an app |
@@ -88,12 +96,13 @@ shop  v1       shop.example.com
 ## appdeploy apps destroy
 
 ```
-appdeploy apps destroy <app>
+appdeploy apps destroy <app> [--delete-volumes]
 ```
 
 **Destructive.** Stops and removes the app's containers, removes its images, network, git
 repository, releases, secrets and routes. It **keeps** the app's Postgres database and role and
-its backups (delete them by hand if you want them gone). Refuses while a deploy is running.
+its backups (delete them by hand if you want them gone), and its **volumes**, unless you pass
+`--delete-volumes`; the message lists the volumes that stay. Refuses while a deploy is running.
 **Admin.**
 
 ## appdeploy deploy
@@ -259,9 +268,55 @@ restart. `--check` only reports. `--force` allows the same or an older version a
 while deploys are running. See [Operations: updating](operations.md#updating-appdeploy).
 **Admin.**
 
+## appdeploy check
+
+```
+appdeploy check [<file>] [--json]
+```
+
+Validates an `appdeploy.yml` **on your machine, without a server**, with the same parser a deploy
+uses, and prints every mistake at once (unknown keys, bad sizes and durations). Without a file it
+checks `appdeploy.yml` in the current directory; if there is none, the defaults apply and it says
+so. It cannot know the server's limits (free memory, disk): those are checked when you deploy.
+Exit status 0 if valid, 1 if not, 2 for a wrong option. With `--json`:
+`{"valid":true,"file":"appdeploy.yml","config":{...}}` where `config` is the file with every default
+filled in, or `{"valid":false,"file":...,"error":"..."}`.
+
+## appdeploy import kamal
+
+```
+appdeploy import kamal [<config/deploy.yml>] [--secrets <file>] [--out <appdeploy.yml>] [--force] [--json]
+```
+
+Reads a Kamal setup **on your machine** and prints what it becomes on appdeploy; it changes nothing
+on any server and never reads secret values (`.kamal/secrets` is read only for the names). The
+report has the generated `appdeploy.yml` (checked by the same parser as `check`), then:
+
+- **BLOCKERS**: things that stop the app from running on appdeploy as it is, such as Kamal `volumes`
+  (directories of the host; named volumes are converted) or accessories other than Postgres and Redis;
+- **NOT CARRIED OVER**: settings with no equivalent (per-role environment, `env.tags`, proxy
+  tuning, builder secrets, ...);
+- **TO DECIDE OR CHECK**: things that differ (the app name, the registry, non-secret environment
+  that becomes the `env:` section, the volumes to copy data into, secrets named in `.kamal/secrets` but not used);
+- **COMMANDS**: `apps create`, `secrets set` (names, with your environment's values), and the git
+  remote, in order.
+
+Exit status is 1 when there are blockers, so a script can stop. `--out` writes the
+`appdeploy.yml` (it refuses to overwrite without `--force`). With `--json` the whole report is one
+object: `verdict` (`ready`, `ready-with-notes`, `blocked`), `appdeploy_yml`, `commands`, `blockers`,
+`unsupported`, `notes`. Read [Migration](migration.md#from-kamal) next.
+
 ## appdeploy version
 
-Prints `appdeploy <version>` (`dev` for a build that did not come from a release).
+```
+appdeploy version [--verbose]
+```
+
+Prints `appdeploy <version>` (`dev` for a build that did not come from a release). `--verbose` also
+prints the repository updates come from and the **release key** this binary trusts, with its SHA-256
+fingerprint, to compare with the one in the release notes (see
+[Getting started](getting-started.md#1-get-the-binary-and-the-install-script)). With `--json`:
+`{"version","update_repository","release_key","release_key_fingerprint"}`.
 
 ## appdeploy agent, hook, shell, recover
 

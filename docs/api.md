@@ -23,7 +23,7 @@ Times are RFC 3339. A deploy's `state` is one of `queued`, `validating`, `buildi
 | `POST /v1/apps` | `{"name","domains":[],"branch"}` | 201, the app: `{"name","domains","branch","current_release","created_at"}` |
 | `GET /v1/apps` | | list of apps |
 | `GET /v1/apps/{app}` | | `{"app":{...},"containers":[{"name","role","release","running","restarts","host_port"}],"deploys":[{"id","app","release","state","error","ref","source","started_at","finished_at"}],"releases":[{"number","commit","image","created_at","current"}]}` |
-| `DELETE /v1/apps/{app}` | | `{"ok":true}` (destructive) |
+| `DELETE /v1/apps/{app}` | query `volumes=1` also deletes the volumes | `{"ok":true,"kept_volumes":[...]}` (destructive) |
 | `PUT /v1/apps/{app}/domains` | `{"domains":[]}` | `{"ok":true}` |
 | `GET /v1/apps/{app}/releases` | | list of releases |
 | `GET /v1/apps/{app}/export?format=kamal` | | `{"files":{"path":"content"}}` |
@@ -42,7 +42,7 @@ events endpoint.
 | `GET /v1/deploys/{id}` | the deploy, as above |
 | `GET /v1/deploys/{id}/events?after=N` | newline-delimited JSON: `{"id","time","msg"}` for each journal line, ending with `{"done":true,"state","error"}` |
 
-The events stream is how to wait: read until a line with `"done":true` and check `state`
+The `time` field is absent on the last line. The events stream is how to wait: read until a line with `"done":true` and check `state`
 (`succeeded` is success). Reconnect with `after=<last id>` if the connection drops; the deploy
 does not depend on it.
 

@@ -46,8 +46,11 @@ remote: ==> succeeded: myapp is now serving v2
   and sent between your servers directly.
 - **Small groups without Kubernetes.** 1 to about 10 servers: roles placed by labels, canary
   first, a failed rollout is undone, a server that was down catches up by itself.
-- **Easy to leave.** `appdeploy export` writes the same setup for Kamal, Docker Compose,
+- **Easy to move in and out.** `appdeploy import kamal` reads a Kamal setup and says what it becomes
+  (and what blocks it); `appdeploy export` writes the same setup for Kamal, Docker Compose,
   Kubernetes or Fly. Your app only needs a Dockerfile, environment variables and `GET /up`.
+- **Made to be operated by scripts and AI assistants:** `--json` on every command, a local
+  `appdeploy check` for the config, and [a guide written for LLMs](docs/llm-guide.md).
 - **Batteries for small apps:** Postgres and Redis per app with daily backups, secrets per
   release, webhooks (Slack, Telegram, generic), signed self-update, SSH roles.
 
@@ -128,7 +131,9 @@ Files for ingestion: [`llms.txt`](../llms.txt) (an index) and
    one is verified, and for a few minutes after the switch. A failed deploy changes nothing for
    users. The system may **roll back by itself** (`rolled_back`): that is it working, not a bug.
 4. **Secrets** are environment variables stored on the server. Releases freeze their secrets.
-5. Containers are **stateless** (no volumes). Data lives in Postgres/Redis or elsewhere.
+5. Containers are disposable. Data lives in Postgres/Redis or elsewhere; files that must survive can go in a
+   **named volume** (`roles.<name>.volumes: ["data:/data"]`), which is not backed up. Non-secret environment
+   goes in `env:` of `appdeploy.yml`, secrets in `secrets set`.
 6. The CLI is `appdeploy`. From a workstation: `appdeploy --host deploy@SERVER <command>`. On the
    server itself: `appdeploy <command>` (needs root or the socket group).
 
@@ -165,7 +170,9 @@ Follow these in order of importance.
 
 | Command | What it does | Undo | Ask first? | Role |
 |---|---|---|---|---|
-| `ping`, `version`, `status`, `apps list`, `releases`, `db list`, `group servers` | read only | n/a | no | viewer |
+| `ping`, `version [--verbose]`, `status`, `apps list`, `releases`, `db list`, `group servers` | read only | n/a | no | viewer |
+| `check [FILE]` | validates an `appdeploy.yml` on this machine; no server involved | n/a | no | local |
+| `import kamal [FILE]` | reads a Kamal config on this machine and prints a plan; changes nothing | n/a | no (but show the person the blockers) | local |
 | `logs APP [--role R] [--tail N]` | prints container logs (may contain personal data) | n/a | no | deployer |
 | `secrets list APP` | names of secrets | n/a | no | deployer |
 | `export APP --format F` | prints config for another tool (no secret values) | n/a | no | admin |
@@ -180,7 +187,7 @@ Follow these in order of importance.
 | `exec APP -- CMD` | runs a command in the live container | depends on CMD | **yes** | admin |
 | `db backup APP` | writes a backup file | delete the file | no | admin |
 | `db restore APP NAME` | **replaces the database's tables** | only by restoring another backup | **always** | admin |
-| `apps destroy APP` | **removes the app, its images, releases and secrets** (the database is kept) | no | **always** | admin |
+| `apps destroy APP [--delete-volumes]` | **removes the app, its images, releases and secrets** (the database and the volumes are kept unless `--delete-volumes`) | no | **always** | admin |
 | `secrets export APP` | **prints secret values** | n/a | **always, and say where the output goes** | admin |
 | `self-update`, `self-update --force` | replaces the binary and restarts the agent | the agent reverts a bad update by itself | **yes** | admin |
 | `group set-version V` | every server installs release V, one after another | set another version | **yes** | admin |
@@ -237,9 +244,10 @@ services:
   postgres: true         # provides DATABASE_URL
 ```
 
-There is no dry run, but an invalid file fails in the `validating` step, before anything is built or
-changed, so it is safe to try. Unknown keys are errors: use only the keys in
-[Configuration](configuration.md).
+Run `appdeploy check appdeploy.yml` before you commit: it uses the parser of the deploy and reports
+every mistake at once (it does not know the server's free memory or disk). An invalid file also
+fails in the `validating` step of a deploy, before anything is built or changed, so a mistake is
+cheap. Unknown keys are errors: use only the keys in [Configuration](configuration.md).
 
 ### Back up and restore a database
 
@@ -271,7 +279,11 @@ command has to exist in the image. Do not use it to read secrets.
   usage. The exit status of `git push` is **not** a signal.
 - Terminal states of a deploy: `succeeded`, `failed` (old release still live), `rolled_back` (old
   release live again), `superseded` (a newer deploy replaced a waiting one).
-- The text tables are for people and may change. For parsing, use the JSON API on the server:
+- **Ask for JSON.** Add `--json` to any command (`appdeploy --host H status APP --json`): lists and
+  objects come as one JSON line, a deploy as one JSON line per journal entry whose last line is
+  `{"done":true,"state":"succeeded"|"failed"|"rolled_back"|"superseded","error":"..."}`, and errors as
+  `{"error":"..."}`. Parse that, not the text tables, which may change. It works over `--host` for every role.
+- On the server you can also use the JSON API directly:
 
 ```bash
 curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/apps/APP | jq '.app.current_release, .containers, .deploys[0]'
@@ -293,9 +305,10 @@ curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/deploys/DEPLOY_I
 
 ## Not supported: say so, do not improvise
 
-Persistent volumes for the app; buildpacks (a Dockerfile is required); interactive shells or consoles;
+Host directory mounts, volume drivers and backups of volumes; buildpacks (a Dockerfile is required); interactive shells or consoles;
 Windows servers; more than about ten servers; a web UI; off-site backups; automatic import from
-other tools (see [Migration](migration.md) for the manual steps and `appdeploy export` for leaving).
+tools other than Kamal (`appdeploy import kamal` exists; for others see [Migration](migration.md) for the
+manual steps, and `appdeploy export` for leaving).
 
 ## Defaults worth knowing
 
@@ -354,9 +367,23 @@ Read `install.sh` before you run it; it runs as root. For your **own computer** 
 matching binary (`appdeploy-darwin-arm64`, `appdeploy-darwin-amd64` or `appdeploy-linux-arm64`),
 rename it to `appdeploy` and put it on your `PATH`.
 
-Releases are signed. The binary verifies the signature of later releases itself
-(`appdeploy self-update`), but the very first download is trusted only as far as GitHub and the
-checksum file are.
+**Check where it came from.** The checksum only proves the download is intact. Each release binary
+also carries a build attestation: proof that it was built by this repository's release workflow
+and not uploaded from somewhere else. Verify it with the GitHub CLI:
+
+```bash
+gh attestation verify appdeploy-linux-amd64 --repo merkushin/appdeploy
+```
+
+(Releases made before attestations were added, up to v0.1.1, do not have one.) The release notes
+also print the fingerprint of the key the binary will trust for updates. After installing, compare:
+
+```bash
+appdeploy version --verbose      # shows the release key and its fingerprint
+```
+
+From then on, `appdeploy self-update` accepts only releases signed with that key, so the first
+download is the one you verify by hand.
 
 ## 2. Install on the server
 
@@ -398,8 +425,9 @@ appdeploy runs your app as a container built from your Dockerfile, and needs thr
    `roles.web.healthcheck.path`.
 
 Also good to know: stop cleanly on `SIGTERM` (you get 30 seconds, `roles.web.stop_timeout`),
-keep state in a database, not in the container (apps get **no persistent volumes**), and read
-configuration from environment variables. A minimal example is in
+keep state in a database or in a named volume (`roles.<name>.volumes`), not in the container's
+own file system, and read configuration from environment variables (`env:` in `appdeploy.yml`
+for the ones that are not secret). A minimal example is in
 [`examples/hello`](../examples/hello).
 
 ## 4. Create the app and deploy
@@ -607,9 +635,10 @@ releases and the deploy journal, the git repositories, secrets (mode 0600) and b
 
 ## Where appdeploy has opinions
 
-- Containers are stateless: **no volumes for your app.** Persistent data belongs in Postgres,
-  Redis or an external service. appdeploy can run Postgres and Redis for you
-  (`services:`), with backups.
+- Containers are disposable. Persistent data belongs in Postgres, Redis (appdeploy can run both
+  for you, with backups) or an external service; files that must survive can go in a **named
+  volume** (`roles.<name>.volumes`), which is not backed up and is shared by the old and the new
+  release until the watch window ends.
 - You provide a Dockerfile. appdeploy never guesses a build.
 - One web port per app, one proxy per server. Spreading traffic across several servers is up to
   a load balancer in front; each server answers `GET /health/<app>` for it.
@@ -634,6 +663,12 @@ appdeploy [--host user@host] [--socket path] <command> [arguments]
   read-only commands, a *deployer* adds deploy, rollback and logs, an *admin* can run everything.
   The tables below say which. See [Operations: security](operations.md#security).
 
+- **`--json`** (anywhere before a `--`) prints JSON instead of text, for scripts and AI assistants:
+  one line per object or list; for a deploy one JSON line per journal entry, the last being
+  `{"done":true,"state":"succeeded","error":""}`; errors as `{"error":"message"}` on stdout. It works
+  over `--host` and for every role. Fields are those of the [HTTP API](api.md). Commands that print
+  free text (`logs`, `exec`) ignore it.
+
 Most commands that change something stream the agent's journal until the deploy ends, so you
 see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continues on the server**
 (its id is printed so you can look it up).
@@ -643,6 +678,8 @@ see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continu
 | Command | Role | |
 |---|---|---|
 | [`appdeploy ping`](#appdeploy-ping) | viewer | is the agent up |
+| [`appdeploy check`](#appdeploy-check) | local | validate an `appdeploy.yml` |
+| [`appdeploy import kamal`](#appdeploy-import-kamal) | local | turn a Kamal setup into appdeploy's |
 | [`appdeploy status`](#appdeploy-status) | viewer | what runs |
 | [`appdeploy apps list`](#appdeploy-apps-list) | viewer | all apps |
 | [`appdeploy releases`](#appdeploy-releases) | viewer | releases of an app |
@@ -708,12 +745,13 @@ shop  v1       shop.example.com
 ## appdeploy apps destroy
 
 ```
-appdeploy apps destroy <app>
+appdeploy apps destroy <app> [--delete-volumes]
 ```
 
 **Destructive.** Stops and removes the app's containers, removes its images, network, git
 repository, releases, secrets and routes. It **keeps** the app's Postgres database and role and
-its backups (delete them by hand if you want them gone). Refuses while a deploy is running.
+its backups (delete them by hand if you want them gone), and its **volumes**, unless you pass
+`--delete-volumes`; the message lists the volumes that stay. Refuses while a deploy is running.
 **Admin.**
 
 ## appdeploy deploy
@@ -879,9 +917,55 @@ restart. `--check` only reports. `--force` allows the same or an older version a
 while deploys are running. See [Operations: updating](operations.md#updating-appdeploy).
 **Admin.**
 
+## appdeploy check
+
+```
+appdeploy check [<file>] [--json]
+```
+
+Validates an `appdeploy.yml` **on your machine, without a server**, with the same parser a deploy
+uses, and prints every mistake at once (unknown keys, bad sizes and durations). Without a file it
+checks `appdeploy.yml` in the current directory; if there is none, the defaults apply and it says
+so. It cannot know the server's limits (free memory, disk): those are checked when you deploy.
+Exit status 0 if valid, 1 if not, 2 for a wrong option. With `--json`:
+`{"valid":true,"file":"appdeploy.yml","config":{...}}` where `config` is the file with every default
+filled in, or `{"valid":false,"file":...,"error":"..."}`.
+
+## appdeploy import kamal
+
+```
+appdeploy import kamal [<config/deploy.yml>] [--secrets <file>] [--out <appdeploy.yml>] [--force] [--json]
+```
+
+Reads a Kamal setup **on your machine** and prints what it becomes on appdeploy; it changes nothing
+on any server and never reads secret values (`.kamal/secrets` is read only for the names). The
+report has the generated `appdeploy.yml` (checked by the same parser as `check`), then:
+
+- **BLOCKERS**: things that stop the app from running on appdeploy as it is, such as Kamal `volumes`
+  (directories of the host; named volumes are converted) or accessories other than Postgres and Redis;
+- **NOT CARRIED OVER**: settings with no equivalent (per-role environment, `env.tags`, proxy
+  tuning, builder secrets, ...);
+- **TO DECIDE OR CHECK**: things that differ (the app name, the registry, non-secret environment
+  that becomes the `env:` section, the volumes to copy data into, secrets named in `.kamal/secrets` but not used);
+- **COMMANDS**: `apps create`, `secrets set` (names, with your environment's values), and the git
+  remote, in order.
+
+Exit status is 1 when there are blockers, so a script can stop. `--out` writes the
+`appdeploy.yml` (it refuses to overwrite without `--force`). With `--json` the whole report is one
+object: `verdict` (`ready`, `ready-with-notes`, `blocked`), `appdeploy_yml`, `commands`, `blockers`,
+`unsupported`, `notes`. Read [Migration](migration.md#from-kamal) next.
+
 ## appdeploy version
 
-Prints `appdeploy <version>` (`dev` for a build that did not come from a release).
+```
+appdeploy version [--verbose]
+```
+
+Prints `appdeploy <version>` (`dev` for a build that did not come from a release). `--verbose` also
+prints the repository updates come from and the **release key** this binary trusts, with its SHA-256
+fingerprint, to compare with the one in the release notes (see
+[Getting started](getting-started.md#1-get-the-binary-and-the-install-script)). With `--json`:
+`{"version","update_repository","release_key","release_key_fingerprint"}`.
 
 ## appdeploy agent, hook, shell, recover
 
@@ -969,6 +1053,8 @@ notify: [https://hooks.slack.com/services/...]
 | `roles.<name>.healthcheck.start_period` | `60s` | How long a new container has to become healthy. |
 | `roles.<name>.smoke` | none | Extra paths (starting with `/`) that must answer below 500 before the switch. |
 | `roles.<name>.stop_timeout` | `30s` | Time to finish in-flight work after `SIGTERM` before the container is killed. |
+| `env` | none | A map of non-secret environment variables for every container, kept in git. Names are letters, digits and `_`; `PORT` and `APPDEPLOY_*` are reserved; values are single-line. Secrets with the same name win. Do not put secrets here: `appdeploy check` warns about names that look like one. |
+| `roles.<name>.volumes` | none | Named volumes to mount, as `name:/absolute/path[:ro]`. The name is lowercase letters, digits, `-` and `_`; host directories are not supported. The Docker volume is `ad-<app>-<name>` (with the default `--instance`), is created on the first deploy, is shared by every release and is never removed by a deploy. Not backed up by appdeploy. |
 | `release_command` | none | Run once per deploy before traffic moves, in a throwaway container of the new image with the release's environment. Like `cmd` it replaces the image's `CMD`. A failure stops the deploy. |
 | `services.postgres` | `false` | A database for this app on the server's shared Postgres; provides `DATABASE_URL`. |
 | `services.redis` | `false` | A Redis database number on the shared Redis; provides `REDIS_URL`. |
@@ -985,7 +1071,7 @@ few seconds after start.
 
 ### The environment of your containers
 
-Every container gets the app's secrets, plus:
+Every container gets the `env` section of `appdeploy.yml`, then the app's secrets (a secret overrides an `env` entry of the same name), plus:
 
 | Variable | Value |
 |---|---|
@@ -993,6 +1079,21 @@ Every container gets the app's secrets, plus:
 | `APPDEPLOY_APP`, `APPDEPLOY_RELEASE`, `APPDEPLOY_ROLE` | the app, the release number, the role name |
 | `APPDEPLOY_SERVER` | the server's name (in a group) |
 | `DATABASE_URL`, `REDIS_URL` | when `services` asks for them (a secret of the same name wins) |
+
+### Volumes
+
+A volume keeps files across deploys, rollbacks and restarts. Only **named volumes** are supported.
+Things to know:
+
+- During a deploy the old and the new container run at the same time, and both have the volume until
+  the old one stops, after `watch.window` (3 minutes by default). Files that must have one writer,
+  such as a SQLite database, are used by two processes meanwhile. SQLite copes with that in WAL mode,
+  but you may set `watch.window` lower. The deploy log prints a warning, and `appdeploy check`
+  warns when `replicas_per_server` is above 1 on a writable volume.
+- If the image declares `VOLUME /data` and the role does not mount something there, the deploy is
+  refused: Docker would use an anonymous volume that is deleted with the container.
+- `appdeploy apps destroy` keeps the volumes (use `--delete-volumes` to remove them).
+- Volumes live on one server. In a group, each server has its own copy of the data.
 
 ## Agent flags
 
@@ -1075,7 +1176,7 @@ Times are RFC 3339. A deploy's `state` is one of `queued`, `validating`, `buildi
 | `POST /v1/apps` | `{"name","domains":[],"branch"}` | 201, the app: `{"name","domains","branch","current_release","created_at"}` |
 | `GET /v1/apps` | | list of apps |
 | `GET /v1/apps/{app}` | | `{"app":{...},"containers":[{"name","role","release","running","restarts","host_port"}],"deploys":[{"id","app","release","state","error","ref","source","started_at","finished_at"}],"releases":[{"number","commit","image","created_at","current"}]}` |
-| `DELETE /v1/apps/{app}` | | `{"ok":true}` (destructive) |
+| `DELETE /v1/apps/{app}` | query `volumes=1` also deletes the volumes | `{"ok":true,"kept_volumes":[...]}` (destructive) |
 | `PUT /v1/apps/{app}/domains` | `{"domains":[]}` | `{"ok":true}` |
 | `GET /v1/apps/{app}/releases` | | list of releases |
 | `GET /v1/apps/{app}/export?format=kamal` | | `{"files":{"path":"content"}}` |
@@ -1094,7 +1195,7 @@ events endpoint.
 | `GET /v1/deploys/{id}` | the deploy, as above |
 | `GET /v1/deploys/{id}/events?after=N` | newline-delimited JSON: `{"id","time","msg"}` for each journal line, ending with `{"done":true,"state","error"}` |
 
-The events stream is how to wait: read until a line with `"done":true` and check `state`
+The `time` field is absent on the last line. The events stream is how to wait: read until a line with `"done":true` and check `state`
 (`succeeded` is success). Reconnect with `after=<last id>` if the connection drops; the deploy
 does not depend on it.
 
@@ -1370,7 +1471,9 @@ server, for example with a nightly job on another machine:
 rsync -a --delete root@my-server:/var/lib/appdeploy/backups/ /backups/appdeploy/
 ```
 
-`apps destroy` keeps an app's database and backups on purpose.
+`apps destroy` keeps an app's database and backups on purpose, and its volumes too (`--delete-volumes`
+removes them). **Volumes are not backed up**: copy them off the server, for example with
+`docker run --rm -v ad-APP-NAME:/from:ro -v $PWD:/to alpine tar -C /from -czf /to/APP-NAME.tgz .`.
 
 ## Notifications
 
@@ -1425,7 +1528,9 @@ logs because they carry secrets.
 
 ## Updating appdeploy
 
-Releases are published on GitHub, signed with a key whose public half is built into every binary.
+Releases are published on GitHub, signed with a key whose public half is built into every binary
+(`appdeploy version --verbose` shows it and its fingerprint, which the release notes repeat).
+Each binary also has a build attestation: `gh attestation verify <file> --repo merkushin/appdeploy`.
 
 ```bash
 appdeploy --host deploy@my-server self-update --check     # is there a newer release
@@ -1548,6 +1653,7 @@ traffic. A single failed request does not trigger anything.
 | `vN is already the current release` | `rollback --to N` of the live release. |
 | `app "x" has nothing deployed yet` | `redeploy` before the first deploy. |
 | `app "x" has a deploy in progress` (apps destroy) | Wait for it. |
+| `the image declares VOLUME` | The Dockerfile has `VOLUME /path` and the role mounts nothing there; Docker would lose the data at the next deploy. Add `roles.<name>.volumes: ["data:/path"]` or remove `VOLUME`. |
 | `docker is not reachable` (agent start) | Docker is not running: `systemctl status docker`. |
 
 ## HTTPS and domains
@@ -1590,8 +1696,8 @@ traffic. A single failed request does not trigger anything.
 
 # Migration
 
-There are no automatic importers yet. Moving is a few manual steps, listed here for the common
-sources, and [leaving appdeploy](#leaving-appdeploy) is one command plus your data.
+There is an importer for Kamal (`appdeploy import kamal`); for other sources moving is a few
+manual steps, listed here, and [leaving appdeploy](#leaving-appdeploy) is one command plus your data.
 
 The model that makes moves cheap: your app is a **Dockerfile**, **environment variables** and
 `GET /up`. Everything else (ports, domains, limits) is a few lines of
@@ -1601,7 +1707,7 @@ The model that makes moves cheap: your app is a **Dockerfile**, **environment va
 
 | If your app... | Then |
 |---|---|
-| writes files it must keep (uploads, SQLite) | It does not fit as is: containers have **no persistent volumes**. Move that data to Postgres, object storage, or another service first. |
+| writes files it must keep (uploads, SQLite) | Mount a named volume (`roles.<name>.volumes`) and copy the data in ([moving a volume](#moving-a-volume)). Volumes are not backed up by appdeploy; for important data prefer Postgres or object storage. |
 | is built with buildpacks (Heroku, Dokku, Fly) and has no Dockerfile | Write a Dockerfile. appdeploy never guesses a build. |
 | needs more than ~10 servers or autoscaling | Not what appdeploy is for. |
 | has background workers or cron | Fine: extra roles (`cmd:`). Run schedules inside a worker process; there is no cron feature. |
@@ -1620,16 +1726,29 @@ or another port), deploy, test with a temporary domain, move the data, then swit
 | `proxy: host / hosts, ssl` | `domains:` (HTTPS is automatic) |
 | `proxy: app_port` | `roles.web.port` |
 | `proxy: healthcheck: path` | `roles.web.healthcheck.path` |
-| `env: clear:` | set as secrets (`secrets set`), or `ENV` lines in the Dockerfile |
+| `env: clear:` | the `env:` section of `appdeploy.yml` |
 | `env: secret:` and `.kamal/secrets` | `appdeploy secrets set <app> NAME=value...` |
 | `accessories:` postgres / redis | `services: {postgres: true}` (a database per app, backups) or keep your own and set `DATABASE_URL` |
 | `accessories:` anything else | run it yourself next to appdeploy, or keep it on Kamal |
-| `volumes:` | not supported (see above) |
+| `volumes:` (named) | `roles.<name>.volumes` (see [moving a volume](#moving-a-volume)); a host directory is not supported |
 | `hooks/pre-deploy` (migrations) | `release_command:` |
 | `builder:` options | not needed (build happens on the server) |
 | `kamal deploy` | `git push prod main` (or `appdeploy deploy`) |
 | `kamal rollback <version>` | `appdeploy rollback <app> [--to N]` |
 | `kamal app logs`, `kamal app exec` | `appdeploy logs`, `appdeploy exec` |
+
+**Let the tool do the reading first.** In your project directory, on your computer:
+
+```bash
+appdeploy import kamal                 # reads config/deploy.yml and .kamal/secrets
+appdeploy import kamal --out appdeploy.yml
+```
+
+It prints the `appdeploy.yml` for the app, the commands to create it and set its secrets, and
+three lists: **blockers** (the app cannot run on appdeploy as it is: host directory mounts, accessories other
+than Postgres and Redis), **not carried over**, and **things to decide**. It changes nothing on any
+server and does not read secret values. Solve the blockers before you go on; the tables below explain
+each mapping, and `appdeploy check appdeploy.yml` validates the result.
 
 Steps: install appdeploy on a **new** server, create the app with its domain(s), `secrets set`
 the values from `.kamal/secrets`, push, check with a test request (`curl --resolve
@@ -1644,12 +1763,12 @@ want ports 80 and 443: expect a short gap while you stop Kamal's proxy and start
 |---|---|
 | a service that serves HTTP | the `web` role; `ports:` becomes `domains:` and `roles.web.port` |
 | other services running your image with another `command:` | roles with `cmd:` |
-| `environment:`, `env_file:` | `secrets set` (or `ENV` in the Dockerfile for non-secret defaults) |
+| `environment:`, `env_file:` | `env:` in `appdeploy.yml` for plain values, `secrets set` for secrets |
 | `build:` | the Dockerfile (and `build.context`, `build.args`) |
 | `mem_limit`, `cpus` | `roles.<name>.memory`, `.cpus` |
 | `healthcheck:` | `roles.web.healthcheck` (an HTTP path, probed from outside) |
 | `postgres`, `redis` services | `services:` (or keep them elsewhere with `DATABASE_URL`) |
-| `volumes:` for your app | not supported |
+| named `volumes:` for your app | `roles.<name>.volumes`; bind mounts are not supported |
 | a reverse proxy service (Caddy, Traefik, nginx) | not needed: Caddy is built in |
 
 Put the repository's Dockerfile at the root, write `appdeploy.yml` from the table, push.
@@ -1679,10 +1798,27 @@ Put the repository's Dockerfile at the root, write `appdeploy.yml` from the tabl
 | `[processes]` | roles (`cmd:`) |
 | `[vm] memory` | `roles.<name>.memory` |
 | `fly secrets set`, dashboard env vars | `secrets set` |
-| `[mounts]` volumes | not supported |
+| `[mounts]` volumes | `roles.<name>.volumes` (copy the data in: [moving a volume](#moving-a-volume)) |
 | managed Postgres | keep it and set `DATABASE_URL`, or `services: {postgres: true}` and restore a dump |
 | `fly deploy` | `git push prod main` |
 | certificates | automatic |
+
+## Moving a volume
+
+appdeploy creates the volume `ad-<app>-<name>` on the first deploy (`ad` is the agent's
+`--instance`). Data from an old volume is copied into it **before the first deploy**, with the old
+app stopped so nothing is written meanwhile. Create the new volume with the labels that make
+`apps destroy` know it, copy, and check:
+
+```bash
+APP=myapp; NAME=data; OLD=myapp_data      # your app, the volume name in appdeploy.yml, the old volume
+docker volume create --label appdeploy.instance=ad --label appdeploy.app=$APP --label appdeploy.volume=$NAME ad-$APP-$NAME
+docker run --rm -v $OLD:/from:ro -v ad-$APP-$NAME:/to alpine cp -a /from/. /to/
+docker run --rm -v ad-$APP-$NAME:/v:ro alpine ls -la /v
+```
+
+For a SQLite database, stop the old app first (or copy with `sqlite3 old.db ".backup new.db"`) so
+that the copy is consistent. For the files of a host directory, mount it as `/from` instead of the volume.
 
 ## Moving a Postgres database in
 
@@ -1761,8 +1897,9 @@ the Redis container yourself.
 (keeping the database until you are sure) and [uninstall](operations.md#uninstalling).
 
 **What does not carry over:** deploy history and the journal, TLS certificates (the new system
-requests its own), and anything your app kept on the server outside Postgres (it could not keep
-anything, which is why leaving is easy).
+requests its own), and the contents of your app's volumes: `appdeploy export` writes the volume
+mounts into the new tool's file, but you copy the data yourself (`docker run --rm -v ad-APP-NAME:/from:ro
+-v $PWD:/to alpine tar -C /from -cf /to/data.tar .` makes an archive).
 
 ---
 
@@ -1785,7 +1922,7 @@ understand them at the time of writing; check their documentation before decidin
 | Automatic rollback on bad traffic | **yes** (5xx, restarts, health) | no (health check at deploy) | no | no | varies | no | not by default |
 | Multiple servers | small groups, canary, labels | yes, by role/host | one host; other schedulers via plugins | yes | their regions | by hand | yes, at any scale |
 | Needs a Dockerfile | yes | yes | no (buildpacks too) | no (buildpacks too) | no | yes | yes |
-| Persistent volumes for the app | **no** | yes | yes | yes | yes | yes | yes |
+| Persistent volumes for the app | named volumes | yes | yes | yes | yes | yes | yes |
 | Web UI | no | no | no (CLI) | **yes** | yes | no | dashboards |
 | Where it runs | your Linux servers | your Linux servers | your Linux server | your Linux servers | their servers | yours | yours or managed |
 | Leaving | `export` to Kamal, Compose, k8s, Fly | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -1850,9 +1987,10 @@ dozens of services, autoscaling, many teams, stateful workloads. Below that it i
 
 Be sure none of these is a deal breaker before you adopt it:
 
-- **No persistent volumes for your app.** Containers are stateless. Persistent data has to live
-  in Postgres or Redis (appdeploy can run both for you, with backups) or an external service.
-  Apps that write files they need to keep do not fit yet.
+- **Only named volumes, on one server, without backups.** Files that survive deploys can live in
+  a named volume (`roles.<name>.volumes`); host directories, volume drivers and backups of volumes
+  are not supported, and during a deploy the old and the new container share the volume for the
+  watch window. Postgres and Redis (with backups) are the better home for important data.
 - **No buildpacks.** You provide a Dockerfile.
 - **Linux servers and Docker only.** The install script targets Debian and Ubuntu with systemd.
 - **No web UI** and no multi-user accounts beyond SSH key roles.

@@ -15,7 +15,7 @@ understand them at the time of writing; check their documentation before decidin
 | Automatic rollback on bad traffic | **yes** (5xx, restarts, health) | no (health check at deploy) | no | no | varies | no | not by default |
 | Multiple servers | small groups, canary, labels | yes, by role/host | one host; other schedulers via plugins | yes | their regions | by hand | yes, at any scale |
 | Needs a Dockerfile | yes | yes | no (buildpacks too) | no (buildpacks too) | no | yes | yes |
-| Persistent volumes for the app | **no** | yes | yes | yes | yes | yes | yes |
+| Persistent volumes for the app | named volumes | yes | yes | yes | yes | yes | yes |
 | Web UI | no | no | no (CLI) | **yes** | yes | no | dashboards |
 | Where it runs | your Linux servers | your Linux servers | your Linux server | your Linux servers | their servers | yours | yours or managed |
 | Leaving | `export` to Kamal, Compose, k8s, Fly | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -80,9 +80,10 @@ dozens of services, autoscaling, many teams, stateful workloads. Below that it i
 
 Be sure none of these is a deal breaker before you adopt it:
 
-- **No persistent volumes for your app.** Containers are stateless. Persistent data has to live
-  in Postgres or Redis (appdeploy can run both for you, with backups) or an external service.
-  Apps that write files they need to keep do not fit yet.
+- **Only named volumes, on one server, without backups.** Files that survive deploys can live in
+  a named volume (`roles.<name>.volumes`); host directories, volume drivers and backups of volumes
+  are not supported, and during a deploy the old and the new container share the volume for the
+  watch window. Postgres and Redis (with backups) are the better home for important data.
 - **No buildpacks.** You provide a Dockerfile.
 - **Linux servers and Docker only.** The install script targets Debian and Ubuntu with systemd.
 - **No web UI** and no multi-user accounts beyond SSH key roles.

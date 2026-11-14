@@ -38,8 +38,11 @@ remote: ==> succeeded: myapp is now serving v2
   and sent between your servers directly.
 - **Small groups without Kubernetes.** 1 to about 10 servers: roles placed by labels, canary
   first, a failed rollout is undone, a server that was down catches up by itself.
-- **Easy to leave.** `appdeploy export` writes the same setup for Kamal, Docker Compose,
+- **Easy to move in and out.** `appdeploy import kamal` reads a Kamal setup and says what it becomes
+  (and what blocks it); `appdeploy export` writes the same setup for Kamal, Docker Compose,
   Kubernetes or Fly. Your app only needs a Dockerfile, environment variables and `GET /up`.
+- **Made to be operated by scripts and AI assistants:** `--json` on every command, a local
+  `appdeploy check` for the config, and [a guide written for LLMs](docs/llm-guide.md).
 - **Batteries for small apps:** Postgres and Redis per app with daily backups, secrets per
   release, webhooks (Slack, Telegram, generic), signed self-update, SSH roles.
 

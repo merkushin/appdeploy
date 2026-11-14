@@ -780,6 +780,20 @@ Without `--force` it refuses while deploys are in progress. A binary built witho
 public key (a plain `go build`) cannot verify updates and says so. To go back by hand:
 `mv appdeploy.previous appdeploy` and restart the service.
 
+**Trusting the first download.** Releases made by this workflow also get a GitHub build
+attestation (`actions/attest-build-provenance`), checked with
+`gh attestation verify <file> --repo <owner/name>`: it proves the binary was built by the release
+workflow of that repository, independently of our signing key. `appdeploy version --verbose` prints
+the key a binary trusts and its SHA-256 fingerprint (`releasetool fingerprint` makes the same), and
+the notes of every release carry the fingerprint and these instructions. So the first binary is
+verified by attestation, every later one by the built-in key. The attestation step has not run on a
+real release yet (releases up to v0.1.1 have none).
+
+**For scripts and assistants.** `--json` on every command prints JSON (see docs/commands.md),
+`appdeploy check` validates an `appdeploy.yml` locally with the parser of the deploy (and, like the
+deploy, reports all mistakes at once), and `appdeploy import kamal` converts a Kamal setup, naming
+its blockers (host directory mounts, other accessories) instead of guessing.
+
 **Trust.** The signature, not GitHub's TLS, is what is trusted: someone who gets into the
 GitHub account cannot ship code to servers unless they also have the signing key. The risk
 that remains is theft of the key, which lives in the repository's Actions secrets; a
@@ -837,3 +851,13 @@ how it travels from CI over `--host` (a file name is read where the command runs
 `set-version`), the install script downloading the latest release itself (it still takes
 `--binary`), a release channel other than the one named, `--check` notifications, and
 reverting a version that runs but misbehaves.
+
+**Volumes and `env`.** `roles.<name>.volumes` mounts named Docker volumes (`<instance>-<app>-<name>`,
+labeled, created on the first deploy, shared by all releases, kept by `apps destroy` unless
+`--delete-volumes`); host directories are not supported. The old and the new release share a
+volume until the watch window ends, which the deploy log warns about. An image that declares
+`VOLUME` where the role mounts nothing is refused, since Docker would use an anonymous volume
+that dies with the container. `env:` holds non-secret variables of the app, applied below the
+secrets and above the platform variables (`PORT`, `APPDEPLOY_*` are reserved). Volumes are not
+backed up. The Kamal importer converts named volumes and `env.clear` accordingly; the exporters
+write both into their targets.

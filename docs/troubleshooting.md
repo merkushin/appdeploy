@@ -62,6 +62,7 @@ traffic. A single failed request does not trigger anything.
 | `vN is already the current release` | `rollback --to N` of the live release. |
 | `app "x" has nothing deployed yet` | `redeploy` before the first deploy. |
 | `app "x" has a deploy in progress` (apps destroy) | Wait for it. |
+| `the image declares VOLUME` | The Dockerfile has `VOLUME /path` and the role mounts nothing there; Docker would lose the data at the next deploy. Add `roles.<name>.volumes: ["data:/path"]` or remove `VOLUME`. |
 | `docker is not reachable` (agent start) | Docker is not running: `systemctl status docker`. |
 
 ## HTTPS and domains

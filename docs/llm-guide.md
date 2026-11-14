@@ -16,7 +16,9 @@ Files for ingestion: [`llms.txt`](../llms.txt) (an index) and
    one is verified, and for a few minutes after the switch. A failed deploy changes nothing for
    users. The system may **roll back by itself** (`rolled_back`): that is it working, not a bug.
 4. **Secrets** are environment variables stored on the server. Releases freeze their secrets.
-5. Containers are **stateless** (no volumes). Data lives in Postgres/Redis or elsewhere.
+5. Containers are disposable. Data lives in Postgres/Redis or elsewhere; files that must survive can go in a
+   **named volume** (`roles.<name>.volumes: ["data:/data"]`), which is not backed up. Non-secret environment
+   goes in `env:` of `appdeploy.yml`, secrets in `secrets set`.
 6. The CLI is `appdeploy`. From a workstation: `appdeploy --host deploy@SERVER <command>`. On the
    server itself: `appdeploy <command>` (needs root or the socket group).
 
@@ -53,7 +55,9 @@ Follow these in order of importance.
 
 | Command | What it does | Undo | Ask first? | Role |
 |---|---|---|---|---|
-| `ping`, `version`, `status`, `apps list`, `releases`, `db list`, `group servers` | read only | n/a | no | viewer |
+| `ping`, `version [--verbose]`, `status`, `apps list`, `releases`, `db list`, `group servers` | read only | n/a | no | viewer |
+| `check [FILE]` | validates an `appdeploy.yml` on this machine; no server involved | n/a | no | local |
+| `import kamal [FILE]` | reads a Kamal config on this machine and prints a plan; changes nothing | n/a | no (but show the person the blockers) | local |
 | `logs APP [--role R] [--tail N]` | prints container logs (may contain personal data) | n/a | no | deployer |
 | `secrets list APP` | names of secrets | n/a | no | deployer |
 | `export APP --format F` | prints config for another tool (no secret values) | n/a | no | admin |
@@ -68,7 +72,7 @@ Follow these in order of importance.
 | `exec APP -- CMD` | runs a command in the live container | depends on CMD | **yes** | admin |
 | `db backup APP` | writes a backup file | delete the file | no | admin |
 | `db restore APP NAME` | **replaces the database's tables** | only by restoring another backup | **always** | admin |
-| `apps destroy APP` | **removes the app, its images, releases and secrets** (the database is kept) | no | **always** | admin |
+| `apps destroy APP [--delete-volumes]` | **removes the app, its images, releases and secrets** (the database and the volumes are kept unless `--delete-volumes`) | no | **always** | admin |
 | `secrets export APP` | **prints secret values** | n/a | **always, and say where the output goes** | admin |
 | `self-update`, `self-update --force` | replaces the binary and restarts the agent | the agent reverts a bad update by itself | **yes** | admin |
 | `group set-version V` | every server installs release V, one after another | set another version | **yes** | admin |
@@ -125,9 +129,10 @@ services:
   postgres: true         # provides DATABASE_URL
 ```
 
-There is no dry run, but an invalid file fails in the `validating` step, before anything is built or
-changed, so it is safe to try. Unknown keys are errors: use only the keys in
-[Configuration](configuration.md).
+Run `appdeploy check appdeploy.yml` before you commit: it uses the parser of the deploy and reports
+every mistake at once (it does not know the server's free memory or disk). An invalid file also
+fails in the `validating` step of a deploy, before anything is built or changed, so a mistake is
+cheap. Unknown keys are errors: use only the keys in [Configuration](configuration.md).
 
 ### Back up and restore a database
 
@@ -159,7 +164,11 @@ command has to exist in the image. Do not use it to read secrets.
   usage. The exit status of `git push` is **not** a signal.
 - Terminal states of a deploy: `succeeded`, `failed` (old release still live), `rolled_back` (old
   release live again), `superseded` (a newer deploy replaced a waiting one).
-- The text tables are for people and may change. For parsing, use the JSON API on the server:
+- **Ask for JSON.** Add `--json` to any command (`appdeploy --host H status APP --json`): lists and
+  objects come as one JSON line, a deploy as one JSON line per journal entry whose last line is
+  `{"done":true,"state":"succeeded"|"failed"|"rolled_back"|"superseded","error":"..."}`, and errors as
+  `{"error":"..."}`. Parse that, not the text tables, which may change. It works over `--host` for every role.
+- On the server you can also use the JSON API directly:
 
 ```bash
 curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/apps/APP | jq '.app.current_release, .containers, .deploys[0]'
@@ -181,9 +190,10 @@ curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/deploys/DEPLOY_I
 
 ## Not supported: say so, do not improvise
 
-Persistent volumes for the app; buildpacks (a Dockerfile is required); interactive shells or consoles;
+Host directory mounts, volume drivers and backups of volumes; buildpacks (a Dockerfile is required); interactive shells or consoles;
 Windows servers; more than about ten servers; a web UI; off-site backups; automatic import from
-other tools (see [Migration](migration.md) for the manual steps and `appdeploy export` for leaving).
+tools other than Kamal (`appdeploy import kamal` exists; for others see [Migration](migration.md) for the
+manual steps, and `appdeploy export` for leaving).
 
 ## Defaults worth knowing
 
