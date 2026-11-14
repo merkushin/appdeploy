@@ -26,7 +26,7 @@ type member struct {
 }
 
 type groupEnv struct {
-	a, b, c *member
+	a, b, c, d *member
 }
 
 var theGroup *groupEnv
@@ -80,7 +80,8 @@ func (m *member) cli(args ...string) (string, error) {
 	return sh(env.bin, append([]string{"--socket", m.socket}, args...)...)
 }
 
-// needGroup starts three servers once: a (web, db; founder), b (web) and c (worker).
+// needGroup starts four servers once: a (web, db; founder), b (web), c (worker)
+// and d (builder: runs no app, only builds).
 func needGroup(t *testing.T) *groupEnv {
 	t.Helper()
 	if theGroup != nil {
@@ -92,16 +93,16 @@ func needGroup(t *testing.T) *groupEnv {
 	}
 	mk := func(name, labels string) *member {
 		inst := "adg" + name + randHex(2)
-		m := &member{name: name, instance: inst, labels: labels, peerAddr: freeAddr(), pool: "10.80." + map[string]string{"a": "0", "b": "16", "c": "32"}[name] + ".0/20",
+		m := &member{name: name, instance: inst, labels: labels, peerAddr: freeAddr(), pool: "10.80." + map[string]string{"a": "0", "b": "16", "c": "32", "d": "48"}[name] + ".0/20",
 			dataDir: filepath.Join(root, name, "data"), socket: filepath.Join(root, name+".sock")}
 		_ = os.MkdirAll(m.dataDir, 0o755)
 		m.client = api.NewClient(m.socket)
 		return m
 	}
-	g := &groupEnv{a: mk("a", "web,db"), b: mk("b", "web"), c: mk("c", "worker")}
+	g := &groupEnv{a: mk("a", "web,db"), b: mk("b", "web"), c: mk("c", "worker"), d: mk("d", "builder")}
 	theGroup = g
 	extraTeardown = append(extraTeardown, func() {
-		for _, m := range []*member{g.a, g.b, g.c} {
+		for _, m := range []*member{g.a, g.b, g.c, g.d} {
 			m.stop(syscall.SIGTERM)
 			cleanupInstance(m.instance)
 		}
@@ -127,7 +128,7 @@ func needGroup(t *testing.T) *groupEnv {
 	}
 	mustGroup("group", "init", "--data-dir", g.a.dataDir, "--group", "prod", "--server", "a", "--advertise", g.a.peerAddr, "--labels", g.a.labels)
 	g.a.start(t)
-	for _, m := range []*member{g.b, g.c} {
+	for _, m := range []*member{g.b, g.c, g.d} {
 		out, err := g.a.cli("group", "invite")
 		if err != nil {
 			t.Fatalf("invite: %v\n%s", err, out)
@@ -221,11 +222,11 @@ roles:
 
 func TestGroupMembership(t *testing.T) {
 	g := needGroup(t)
-	for _, m := range []*member{g.a, g.b, g.c} {
+	for _, m := range []*member{g.a, g.b, g.c, g.d} {
 		m := m
-		waitFor(t, 15*time.Second, m.name+" to know all 3 servers", func() bool {
+		waitFor(t, 15*time.Second, m.name+" to know all 4 servers", func() bool {
 			out, err := m.cli("group", "servers")
-			return err == nil && strings.Count(out, "\n") == 3 // header + 3 lines, trailing newline trimmed
+			return err == nil && strings.Count(out, "\n") == 4 // header + 4 lines, trailing newline trimmed
 		})
 	}
 	// Only the founder can invite or remove servers.
@@ -250,6 +251,8 @@ func TestGroupRolloutAndRollback(t *testing.T) {
 		t.Fatalf("push: %v\n%s", err, out)
 	}
 	contains(t, out, "rolling out v1 to 3 server(s): a, b, c")
+	contains(t, out, "building on d")
+	contains(t, out, "[d] ==> building") // the build ran on the builder, not on a
 	contains(t, out, "image delivered to b")
 	contains(t, out, "wave 1: a")
 	contains(t, out, "wave 3: c")
@@ -265,6 +268,13 @@ func TestGroupRolloutAndRollback(t *testing.T) {
 	}
 	g.a.expectWeb(t, "gapp", "hello v1")
 	g.b.expectWeb(t, "gapp", "hello v1")
+	// The build server keeps nothing of it, and runs no app.
+	if _, err := sh("docker", "image", "inspect", g.d.instance+"/gapp:v1"); err == nil {
+		t.Errorf("the builder still has the image of v1")
+	}
+	if got := g.d.roles(t, "gapp"); !strings.HasPrefix(got, "none running") {
+		t.Errorf("the builder runs %q", got)
+	}
 
 	// An update replaces the release everywhere and retires the old one.
 	r.write("message.txt", "hello v2\n")
