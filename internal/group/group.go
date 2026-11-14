@@ -51,11 +51,19 @@ func (s Server) HasLabel(labels ...string) bool {
 	return false
 }
 
+// Protocol is the version of what servers say to each other. Servers refuse to
+// coordinate deploys with servers that speak another one, which only happens
+// while a group is being updated; bump it when a change is not backward compatible.
+const Protocol = 1
+
 // State is the replicated membership.
 type State struct {
 	Version int64    `json:"version"`
 	Name    string   `json:"name"`
 	Servers []Server `json:"servers"`
+	// DesiredVersion is the release every server should run (empty: no opinion).
+	// Servers install it themselves, one at a time; see update.Decide.
+	DesiredVersion string `json:"desired_version,omitempty"`
 }
 
 // Group is this server's view of its group.
@@ -274,6 +282,15 @@ func (g *Group) AddServer(s Server) (State, error) {
 		}
 	}
 	g.state.Servers = append(list, s)
+	g.state.Version++
+	return g.state, g.save()
+}
+
+// SetDesiredVersion records the release the group should run and bumps the version.
+func (g *Group) SetDesiredVersion(v string) (State, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.state.DesiredVersion = v
 	g.state.Version++
 	return g.state, g.save()
 }

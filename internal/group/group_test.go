@@ -163,3 +163,27 @@ func TestVersionedMembership(t *testing.T) {
 	}
 	_ = serve
 }
+
+func TestDesiredVersionReplicatesLikeMembership(t *testing.T) {
+	g, err := Init(t.TempDir(), "g", "a", "127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := g.State().Version
+	st, err := g.SetDesiredVersion("v1.2.3")
+	if err != nil || st.DesiredVersion != "v1.2.3" || st.Version != before+1 {
+		t.Fatalf("%+v %v", st, err)
+	}
+	// A member adopts it through the same versioned state, and it survives a reload.
+	member, _ := Init(t.TempDir(), "x", "b", "127.0.0.1:2", nil)
+	if changed, err := member.Apply(State{Version: st.Version + 5, Name: "g", Servers: st.Servers, DesiredVersion: st.DesiredVersion}); err != nil || !changed || member.State().DesiredVersion != "v1.2.3" {
+		t.Errorf("member did not adopt it: %v %v %+v", changed, err, member.State())
+	}
+	again, err := Load(g.Dir, "a")
+	if err != nil || again.State().DesiredVersion != "v1.2.3" {
+		t.Errorf("reload: %v %+v", err, again)
+	}
+	if st, _ := g.SetDesiredVersion(""); st.DesiredVersion != "" {
+		t.Errorf("not cleared: %+v", st)
+	}
+}
