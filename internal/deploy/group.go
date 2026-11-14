@@ -46,6 +46,13 @@ type Remote interface {
 	SendSource(ctx context.Context, srv group.Server, app string, release int, body io.Reader) error
 	// FetchImage streams the built release image (gzip-compressed `docker save`) from a build server.
 	FetchImage(ctx context.Context, srv group.Server, app string, release int) (io.ReadCloser, error)
+	// Ping checks that the server answers.
+	Ping(ctx context.Context, srv group.Server) error
+	// Announce tells the server that a rollout completed; Finals lists what it knows of those.
+	Announce(ctx context.Context, srv group.Server, f store.Final) error
+	Finals(ctx context.Context, srv group.Server) ([]store.Final, error)
+	// FetchRelease asks the server to describe a release it has.
+	FetchRelease(ctx context.Context, srv group.Server, app string, release int) (PeerPayload, error)
 	// StartDeploy asks the server to run the payload and returns its local deploy id.
 	StartDeploy(ctx context.Context, srv group.Server, p PeerPayload) (string, error)
 	// StreamDeploy follows that deploy's journal and returns its final state.
@@ -332,6 +339,10 @@ func (r *run) rollout() error {
 	if len(targets) == 0 {
 		return errors.New("no server of the group carries the labels the roles ask for (roles.*.on)")
 	}
+	targets, err := r.reachable(targets)
+	if err != nil {
+		return err
+	}
 	if r.cfg.Services.Postgres || r.cfg.Services.Redis {
 		for _, t := range targets {
 			if t.Name != g.Self {
@@ -454,6 +465,7 @@ func (r *run) rollout() error {
 	_ = e.st.SetDeployState(r.d.ID, store.StateSucceeded, "")
 	r.d.State = store.StateSucceeded
 	r.logf("==> succeeded: %s is now serving v%d on %s", r.d.App, r.d.Release, strings.Join(names, ", "))
+	e.RecordFinal(r.d.App, r.d.Release)
 	r.dropRemoteBuild()
 	r.emit(notify.DeploySucceeded, "")
 	return nil
@@ -531,7 +543,11 @@ func (r *run) groupRollback() error {
 	var failures []string
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	for _, s := range e.targets(r.cfg) {
+	targets, err := r.reachable(e.targets(r.cfg))
+	if err != nil {
+		return err
+	}
+	for _, s := range targets {
 		s := s
 		wg.Add(1)
 		go func() {
@@ -551,6 +567,7 @@ func (r *run) groupRollback() error {
 	_ = e.st.SetCurrentRelease(r.d.App, r.d.Release)
 	_ = e.st.SetDeployState(r.d.ID, store.StateSucceeded, "")
 	r.d.State = store.StateSucceeded
+	e.RecordFinal(r.d.App, r.d.Release)
 	r.logf("==> succeeded: %s is serving v%d on every server", r.d.App, r.d.Release)
 	return nil
 }
@@ -623,4 +640,32 @@ func (r *run) dropRemoteBuild() {
 	if id, err := r.e.opt.Remote.StartDeploy(ctx, *r.builderSrv, p); err == nil {
 		_, _, _ = r.e.opt.Remote.StreamDeploy(ctx, *r.builderSrv, id, func(string) {})
 	}
+}
+
+// reachable drops servers that do not answer. Without allow_partial an
+// unreachable target stops the deploy; with it the server is left to catch up.
+func (r *run) reachable(targets []group.Server) ([]group.Server, error) {
+	e := r.e
+	var ok []group.Server
+	for _, t := range targets {
+		if t.Name == e.opt.Group.Self {
+			ok = append(ok, t)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
+		err := e.opt.Remote.Ping(ctx, t)
+		cancel()
+		switch {
+		case err == nil:
+			ok = append(ok, t)
+		case !r.cfg.AllowPartial:
+			return nil, fmt.Errorf("server %s is not reachable (%v); start it, remove it from the group, or set allow_partial: true to roll out to the others and let it catch up", t.Name, err)
+		default:
+			r.logf("WARNING: skipping %s, it is not reachable (%v); it will catch up when it is back", t.Name, err)
+		}
+	}
+	if len(ok) == 0 {
+		return nil, errors.New("none of the servers that run this app is reachable")
+	}
+	return ok, nil
 }

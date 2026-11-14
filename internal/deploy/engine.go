@@ -120,6 +120,8 @@ type Engine struct {
 	mu     sync.Mutex // guards queues and release-number allocation
 	queues map[string]*queue
 
+	catchUp catchUpState
+
 	buildSem  chan struct{} // at most one build at a time per server
 	proxyMu   sync.Mutex
 	secretsMu sync.Mutex

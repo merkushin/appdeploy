@@ -172,6 +172,9 @@ func runAgent(args []string) int {
 		// the next deploy re-applies the routes.
 		log.Printf("recovery: %v", err)
 	}
+	if grp != nil {
+		go eng.RunCatchUp(ctx, 30*time.Second)
+	}
 	log.Printf("agent %s ready: socket %s, data %s, instance %q", version, *socket, *dataDir, *instance)
 
 	errc := make(chan error, 1)

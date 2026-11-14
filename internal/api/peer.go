@@ -44,6 +44,43 @@ func (p *PeerServer) Handler() http.Handler {
 	mux.HandleFunc("PUT /peer/v1/group", p.auth(p.putGroup))
 	mux.HandleFunc("POST /peer/v1/image", p.auth(p.image))
 	mux.HandleFunc("GET /peer/v1/image", p.auth(p.fetchImage))
+	mux.HandleFunc("GET /peer/v1/finals", p.auth(func(w http.ResponseWriter, r *http.Request) {
+		fs, err := p.Ctl.Eng.Finals()
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if fs == nil {
+			fs = []store.Final{}
+		}
+		writeJSON(w, 200, fs)
+	}))
+	mux.HandleFunc("PUT /peer/v1/final", p.auth(func(w http.ResponseWriter, r *http.Request) {
+		var f store.Final
+		if err := decode(r, &f); err != nil || !config.ValidAppName(f.App) || f.Release < 1 {
+			writeErr(w, errors.New("bad record"))
+			return
+		}
+		if err := p.Ctl.Eng.HandleFinal(f); err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	}))
+	mux.HandleFunc("GET /peer/v1/release", p.auth(func(w http.ResponseWriter, r *http.Request) {
+		app := r.URL.Query().Get("app")
+		rel, _ := strconv.Atoi(r.URL.Query().Get("release"))
+		if !config.ValidAppName(app) || rel < 1 {
+			writeErr(w, errors.New("bad app or release"))
+			return
+		}
+		pl, err := p.Ctl.Eng.ReleasePayload(app, rel)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, pl)
+	}))
 	mux.HandleFunc("POST /peer/v1/source", p.auth(p.source))
 	mux.HandleFunc("POST /peer/v1/deploy", p.auth(p.deploy))
 	mux.HandleFunc("GET /peer/v1/deploys/{id}/events", p.auth(p.Ctl.events))
@@ -95,21 +132,9 @@ func (p *PeerServer) image(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("bad app or release"))
 		return
 	}
-	zr, err := gzip.NewReader(r.Body)
-	if err != nil {
+	if err := p.Ctl.Eng.ImportImage(r.Context(), app, rel, r.Body); err != nil {
 		writeErr(w, err)
 		return
-	}
-	loaded, err := p.Ctl.Dk.Load(r.Context(), zr)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if want := p.Ctl.Eng.ImageTag(app, rel); loaded != want {
-		if err := p.Ctl.Dk.Tag(r.Context(), loaded, want); err != nil {
-			writeErr(w, err)
-			return
-		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -192,6 +217,74 @@ func (c *PeerClient) SendImage(ctx context.Context, srv group.Server, app string
 		return readError(resp)
 	}
 	return nil
+}
+
+func (c *PeerClient) Ping(ctx context.Context, srv group.Server) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, "/peer/v1/ping"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.Group.Client(0).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return readError(resp)
+	}
+	return nil
+}
+
+func (c *PeerClient) Announce(ctx context.Context, srv group.Server, f store.Final) error {
+	b, _ := json.Marshal(f)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(srv, "/peer/v1/final"), bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Group.Client(0).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return readError(resp)
+	}
+	return nil
+}
+
+func (c *PeerClient) Finals(ctx context.Context, srv group.Server) ([]store.Final, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, "/peer/v1/finals"), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.Group.Client(0).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, readError(resp)
+	}
+	var out []store.Final
+	return out, json.NewDecoder(resp.Body).Decode(&out)
+}
+
+func (c *PeerClient) FetchRelease(ctx context.Context, srv group.Server, app string, release int) (deploy.PeerPayload, error) {
+	var pl deploy.PeerPayload
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, fmt.Sprintf("/peer/v1/release?app=%s&release=%d", app, release)), nil)
+	if err != nil {
+		return pl, err
+	}
+	resp, err := c.Group.Client(0).Do(req)
+	if err != nil {
+		return pl, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return pl, readError(resp)
+	}
+	return pl, json.NewDecoder(resp.Body).Decode(&pl)
 }
 
 func (c *PeerClient) SendSource(ctx context.Context, srv group.Server, app string, release int, body io.Reader) error {
