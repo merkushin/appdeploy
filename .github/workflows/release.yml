@@ -1,0 +1,38 @@
+# Publishes a signed release when a version tag is pushed:  git tag v1.2.3 && git push origin v1.2.3
+#
+# One-time setup (see scripts/release.sh):
+#   go run ./cmd/releasetool keygen -out release.key      # keep release.key secret and backed up
+#   repository secret   RELEASE_SIGNING_KEY = the contents of release.key
+#   repository variable RELEASE_PUBLIC_KEY  = the public key keygen printed
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Linux is enough: the binaries are cross-compiled, and nothing here needs macOS.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Build, checksum and sign
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+          REPO: ${{ github.repository }}
+        run: scripts/release.sh "$GITHUB_REF_NAME"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
