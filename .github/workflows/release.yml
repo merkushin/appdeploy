@@ -9,6 +9,9 @@ name: release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Dry run: builds and signs as v0.0.0 but publishes nothing. Use it to check changes to this workflow:
+  #   gh workflow run release.yml --ref <branch>
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,8 +21,8 @@ jobs:
     # Linux is enough: the binaries are cross-compiled, and nothing here needs macOS.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Test
@@ -30,8 +33,11 @@ jobs:
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           REPO: ${{ github.repository }}
-        run: scripts/release.sh "$GITHUB_REF_NAME"
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then version="$GITHUB_REF_NAME"; else version=v0.0.0; fi
+          scripts/release.sh "$version"
       - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
