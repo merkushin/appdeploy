@@ -12,7 +12,9 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -44,6 +46,10 @@ type testEnv struct {
 	agentDone  chan struct{}
 	client     *api.Client
 	healthAddr string
+
+	// Self-update: the binary trusts updKey and looks for releases of acme/tool at gh.
+	updKey ed25519.PrivateKey
+	gh     *fakeGitHub
 }
 
 var env *testEnv
@@ -99,7 +105,10 @@ func setup() (*testEnv, error) {
 	e.client = api.NewClient(e.socket)
 	e.healthAddr = freeAddr()
 
-	if out, err := sh("go", "build", "-o", e.bin, filepath.Join(repoRoot, "cmd", "appdeploy")); err != nil {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	e.updKey = priv
+	e.gh = newFakeGitHub()
+	if out, err := e.buildBinary(e.bin, "0.0.1"); err != nil {
 		return e, fmt.Errorf("building appdeploy: %v\n%s", err, out)
 	}
 	if err := e.startCaddy(); err != nil {
@@ -163,7 +172,7 @@ func (e *testEnv) agentArgs() []string {
 		"--upstream-host", "host.docker.internal",
 		"--min-free-bytes", "1", "--min-free-frac", "0.0001",
 		"--network-pool", "10.81.0.0/20", "--health-listen", e.healthAddr,
-		"--monitor-every", "2s",
+		"--monitor-every", "2s", "--update-api", e.gh.URL(),
 		// The watchdog reads the access log Caddy writes into a shared directory.
 		"--access-log", filepath.Join(e.root, "caddylogs", "access.log"),
 		"--caddy-access-log", "/var/log/caddy/access.log",
@@ -229,6 +238,9 @@ func (e *testEnv) teardown() {
 	e.stopAgent(syscall.SIGTERM)
 	for _, f := range extraTeardown {
 		f()
+	}
+	if e.gh != nil {
+		e.gh.Close()
 	}
 	cleanupInstance(e.instance)
 	if os.Getenv("E2E_KEEP") != "" {
@@ -498,4 +510,12 @@ func freeAddr() string {
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer l.Close()
 	return l.Addr().String()
+}
+
+// buildBinary builds the appdeploy binary as the given version. It trusts the
+// run's signing key and looks for releases of acme/tool.
+func (e *testEnv) buildBinary(path, version string) (string, error) {
+	pub := base64.StdEncoding.EncodeToString(e.updKey.Public().(ed25519.PublicKey))
+	ldflags := fmt.Sprintf("-X main.version=%s -X main.updatePublicKey=%s -X main.updateRepo=acme/tool", version, pub)
+	return sh("go", "build", "-ldflags", ldflags, "-o", path, filepath.Join(e.repoRoot, "cmd", "appdeploy"))
 }
