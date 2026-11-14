@@ -1,11 +1,11 @@
 # Commands
 
 ```
-appdeploy [--host user@host] [--socket path] <command> [arguments]
+appdeploy [--host user@host|name] [--socket path] <command> [arguments]
 ```
 
-- **`--host user@host`** (or the environment variable `APPDEPLOY_HOST`) runs the command on that
-  server over SSH. Without it the command talks to the agent on this machine.
+- **`--host user@host`** runs the command on that server over SSH. Without any server (see
+  [Choosing the server](#choosing-the-server)) the command talks to the agent on this machine.
 - **`--socket path`** (or `APPDEPLOY_SOCKET`) is the agent's socket, default
   `/run/appdeploy/agent.sock`. You need it only when running on the server yourself.
 - **Exit status:** `0` success, `1` the command failed (an error is printed to stderr, a deploy
@@ -24,11 +24,42 @@ Most commands that change something stream the agent's journal until the deploy 
 see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continues on the server**
 (its id is printed so you can look it up).
 
+## Choosing the server
+
+A command runs on the first server found in this list:
+
+1. `--host user@host`, or `--host NAME` for a name defined in `hosts:` of `appdeploy.yml` or saved
+   with `appdeploy hosts add`;
+2. the environment variable `APPDEPLOY_HOST` (an address or a name);
+3. `host: user@host` in the `appdeploy.yml` of the current directory; or its `hosts:` map when it
+   has exactly one entry (with several, you must choose one with `--host NAME`);
+4. the URL of the git remote named `appdeploy`, then `prod`, in the current directory
+   (`deploy@host:app` or `ssh://deploy@host/app`; a URL with a port is not used);
+5. the default of `appdeploy hosts`;
+6. otherwise the agent on this machine.
+
+When the server comes from 3, 4 or 5, the command prints `appdeploy: using the server ... (from
+...)` on stderr, so a repository you cloned cannot send you somewhere unnoticed. An address is
+checked: it may not start with `-` or contain spaces.
+
+## appdeploy hosts
+
+```
+appdeploy hosts [list]
+appdeploy hosts add <name> <user@host> [--default]
+appdeploy hosts remove <name>
+```
+
+Servers saved on this computer in `~/.config/appdeploy/hosts.yml` (the user configuration
+directory of your system; `APPDEPLOY_HOSTS_FILE` overrides the path). The first server added is
+the default. Works without a server. Local.
+
 ## Reading
 
 | Command | Role | |
 |---|---|---|
 | [`appdeploy ping`](#appdeploy-ping) | viewer | is the agent up |
+| [`appdeploy hosts`](#appdeploy-hosts) | local | servers saved on this computer |
 | [`appdeploy check`](#appdeploy-check) | local | validate an `appdeploy.yml` |
 | [`appdeploy import kamal`](#appdeploy-import-kamal) | local | turn a Kamal setup into appdeploy's |
 | [`appdeploy status`](#appdeploy-status) | viewer | what runs |

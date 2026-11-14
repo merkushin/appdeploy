@@ -135,7 +135,10 @@ Files for ingestion: [`llms.txt`](../llms.txt) (an index) and
    **named volume** (`roles.<name>.volumes: ["data:/data"]`), which is not backed up. Non-secret environment
    goes in `env:` of `appdeploy.yml`, secrets in `secrets set`.
 6. The CLI is `appdeploy`. From a workstation: `appdeploy --host deploy@SERVER <command>`. On the
-   server itself: `appdeploy <command>` (needs root or the socket group).
+   server itself: `appdeploy <command>` (needs root or the socket group). `--host` may be left out when
+   the server comes from `APPDEPLOY_HOST`, `host:` in `appdeploy.yml`, a git remote named `prod` or
+   `appdeploy`, or `appdeploy hosts`; the command says on stderr where it took the server from. Do not
+   guess a host: when none is known, ask the user.
 
 ## Rules
 
@@ -409,8 +412,19 @@ Check that it works from your computer:
 appdeploy --host deploy@my-server ping
 ```
 
-No output and exit status 0 means the agent answered. (`--host` is optional if you set
-`APPDEPLOY_HOST=deploy@my-server`.)
+No output and exit status 0 means the agent answered.
+
+Typing `--host` every time is optional. Say where your server is once, in one of these places
+(details in [Commands](commands.md#choosing-the-server)):
+
+```bash
+appdeploy hosts add my-server deploy@my-server    # saved on this computer; the first one is the default
+# or: host: deploy@my-server        in appdeploy.yml of the project
+# or: git remote add prod deploy@my-server:myapp   (the remote named prod or appdeploy)
+appdeploy ping                                      # now without --host
+```
+
+The rest of this guide keeps `--host` in the examples so that each command stands alone.
 
 ## 3. What your app must provide
 
@@ -650,11 +664,11 @@ releases and the deploy journal, the git repositories, secrets (mode 0600) and b
 # Commands
 
 ```
-appdeploy [--host user@host] [--socket path] <command> [arguments]
+appdeploy [--host user@host|name] [--socket path] <command> [arguments]
 ```
 
-- **`--host user@host`** (or the environment variable `APPDEPLOY_HOST`) runs the command on that
-  server over SSH. Without it the command talks to the agent on this machine.
+- **`--host user@host`** runs the command on that server over SSH. Without any server (see
+  [Choosing the server](#choosing-the-server)) the command talks to the agent on this machine.
 - **`--socket path`** (or `APPDEPLOY_SOCKET`) is the agent's socket, default
   `/run/appdeploy/agent.sock`. You need it only when running on the server yourself.
 - **Exit status:** `0` success, `1` the command failed (an error is printed to stderr, a deploy
@@ -673,11 +687,42 @@ Most commands that change something stream the agent's journal until the deploy 
 see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continues on the server**
 (its id is printed so you can look it up).
 
+## Choosing the server
+
+A command runs on the first server found in this list:
+
+1. `--host user@host`, or `--host NAME` for a name defined in `hosts:` of `appdeploy.yml` or saved
+   with `appdeploy hosts add`;
+2. the environment variable `APPDEPLOY_HOST` (an address or a name);
+3. `host: user@host` in the `appdeploy.yml` of the current directory; or its `hosts:` map when it
+   has exactly one entry (with several, you must choose one with `--host NAME`);
+4. the URL of the git remote named `appdeploy`, then `prod`, in the current directory
+   (`deploy@host:app` or `ssh://deploy@host/app`; a URL with a port is not used);
+5. the default of `appdeploy hosts`;
+6. otherwise the agent on this machine.
+
+When the server comes from 3, 4 or 5, the command prints `appdeploy: using the server ... (from
+...)` on stderr, so a repository you cloned cannot send you somewhere unnoticed. An address is
+checked: it may not start with `-` or contain spaces.
+
+## appdeploy hosts
+
+```
+appdeploy hosts [list]
+appdeploy hosts add <name> <user@host> [--default]
+appdeploy hosts remove <name>
+```
+
+Servers saved on this computer in `~/.config/appdeploy/hosts.yml` (the user configuration
+directory of your system; `APPDEPLOY_HOSTS_FILE` overrides the path). The first server added is
+the default. Works without a server. Local.
+
 ## Reading
 
 | Command | Role | |
 |---|---|---|
 | [`appdeploy ping`](#appdeploy-ping) | viewer | is the agent up |
+| [`appdeploy hosts`](#appdeploy-hosts) | local | servers saved on this computer |
 | [`appdeploy check`](#appdeploy-check) | local | validate an `appdeploy.yml` |
 | [`appdeploy import kamal`](#appdeploy-import-kamal) | local | turn a Kamal setup into appdeploy's |
 | [`appdeploy status`](#appdeploy-status) | viewer | what runs |
@@ -1053,6 +1098,8 @@ notify: [https://hooks.slack.com/services/...]
 | `roles.<name>.healthcheck.start_period` | `60s` | How long a new container has to become healthy. |
 | `roles.<name>.smoke` | none | Extra paths (starting with `/`) that must answer below 500 before the switch. |
 | `roles.<name>.stop_timeout` | `30s` | Time to finish in-flight work after `SIGTERM` before the container is killed. |
+| `host` | none | Client side only: the server (`user@host`) that commands run on when you are in this directory and give no `--host`. The agent ignores it. |
+| `hosts` | none | Client side only: named servers, `name: user@host`, for `--host NAME`. See [Choosing the server](commands.md#choosing-the-server). |
 | `env` | none | A map of non-secret environment variables for every container, kept in git. Names are letters, digits and `_`; `PORT` and `APPDEPLOY_*` are reserved; values are single-line. Secrets with the same name win. Do not put secrets here: `appdeploy check` warns about names that look like one. |
 | `roles.<name>.volumes` | none | Named volumes to mount, as `name:/absolute/path[:ro]`. The name is lowercase letters, digits, `-` and `_`; host directories are not supported. The Docker volume is `ad-<app>-<name>` (with the default `--instance`), is created on the first deploy, is shared by every release and is never removed by a deploy. Not backed up by appdeploy. |
 | `release_command` | none | Run once per deploy before traffic moves, in a throwaway container of the new image with the release's environment. Like `cmd` it replaces the image's `CMD`. A failure stops the deploy. |

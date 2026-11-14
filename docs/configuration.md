@@ -70,6 +70,8 @@ notify: [https://hooks.slack.com/services/...]
 | `roles.<name>.healthcheck.start_period` | `60s` | How long a new container has to become healthy. |
 | `roles.<name>.smoke` | none | Extra paths (starting with `/`) that must answer below 500 before the switch. |
 | `roles.<name>.stop_timeout` | `30s` | Time to finish in-flight work after `SIGTERM` before the container is killed. |
+| `host` | none | Client side only: the server (`user@host`) that commands run on when you are in this directory and give no `--host`. The agent ignores it. |
+| `hosts` | none | Client side only: named servers, `name: user@host`, for `--host NAME`. See [Choosing the server](commands.md#choosing-the-server). |
 | `env` | none | A map of non-secret environment variables for every container, kept in git. Names are letters, digits and `_`; `PORT` and `APPDEPLOY_*` are reserved; values are single-line. Secrets with the same name win. Do not put secrets here: `appdeploy check` warns about names that look like one. |
 | `roles.<name>.volumes` | none | Named volumes to mount, as `name:/absolute/path[:ro]`. The name is lowercase letters, digits, `-` and `_`; host directories are not supported. The Docker volume is `ad-<app>-<name>` (with the default `--instance`), is created on the first deploy, is shared by every release and is never removed by a deploy. Not backed up by appdeploy. |
 | `release_command` | none | Run once per deploy before traffic moves, in a throwaway container of the new image with the release's environment. Like `cmd` it replaces the image's `CMD`. A failure stops the deploy. |

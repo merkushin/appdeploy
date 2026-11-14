@@ -78,8 +78,19 @@ Check that it works from your computer:
 appdeploy --host deploy@my-server ping
 ```
 
-No output and exit status 0 means the agent answered. (`--host` is optional if you set
-`APPDEPLOY_HOST=deploy@my-server`.)
+No output and exit status 0 means the agent answered.
+
+Typing `--host` every time is optional. Say where your server is once, in one of these places
+(details in [Commands](commands.md#choosing-the-server)):
+
+```bash
+appdeploy hosts add my-server deploy@my-server    # saved on this computer; the first one is the default
+# or: host: deploy@my-server        in appdeploy.yml of the project
+# or: git remote add prod deploy@my-server:myapp   (the remote named prod or appdeploy)
+appdeploy ping                                      # now without --host
+```
+
+The rest of this guide keeps `--host` in the examples so that each command stands alone.
 
 ## 3. What your app must provide
 

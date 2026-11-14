@@ -20,7 +20,10 @@ Files for ingestion: [`llms.txt`](../llms.txt) (an index) and
    **named volume** (`roles.<name>.volumes: ["data:/data"]`), which is not backed up. Non-secret environment
    goes in `env:` of `appdeploy.yml`, secrets in `secrets set`.
 6. The CLI is `appdeploy`. From a workstation: `appdeploy --host deploy@SERVER <command>`. On the
-   server itself: `appdeploy <command>` (needs root or the socket group).
+   server itself: `appdeploy <command>` (needs root or the socket group). `--host` may be left out when
+   the server comes from `APPDEPLOY_HOST`, `host:` in `appdeploy.yml`, a git remote named `prod` or
+   `appdeploy`, or `appdeploy hosts`; the command says on stderr where it took the server from. Do not
+   guess a host: when none is known, ask the user.
 
 ## Rules
 
