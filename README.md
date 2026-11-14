@@ -8,7 +8,8 @@ Status: usable on one server or a small group. After a deploy the new release is
 against real traffic and rolled back automatically if it misbehaves; deploy events go to
 webhooks; `services: {postgres: true}` gives an app its own database with daily backups;
 several servers work as a group with mutual TLS: one push builds once and rolls out to the
-servers whose labels match, canary first (SPEC.md §21, §23-§25).
+servers whose labels match, canary first. A server labeled `builder` builds for the group, a
+server that was down catches up by itself when it is back (SPEC.md §21, §23-§25).
 
 ## Quick start
 

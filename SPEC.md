@@ -188,6 +188,7 @@ watch:                         # automatic rollback (§8)
   max_restarts: 2
 
 keep_releases: 5
+allow_partial: false           # group: roll out to the reachable servers, let the others catch up (§25)
 notify: []                     # webhook URLs for deploy events
 ```
 
@@ -489,7 +490,7 @@ agent crash; `rollback`, `status`, `logs`, `exec`; `release_command`.
 watchdog with automatic rollback; the migration compatibility check; Postgres/Redis
 services and backups; webhook notifications; disk cleanup.
 
-**M3 — multiple servers** (implemented except `builder` servers and catching-up, see §25)
+**M3 — multiple servers** (implemented, see §25)
 `join`, mTLS, labels and roles; image distribution; waves and canary; `--resume`;
 catching-up servers; health endpoint for external load balancers; `builder` server.
 
@@ -659,15 +660,37 @@ e2e tests can crash the agent at exact moments.
   answer "already serving"; this stands in for `deploy --resume`.
 - `appdeploy` containers get `APPDEPLOY_SERVER` (the server's name) in their environment.
 - `--health-listen :7071` serves `GET /health/<app>`: 200 when the server runs a web
-  container of the live release, 503 otherwise, with no authentication. It does not yet
-  report 503 during `switching`.
+  container of the live release, 503 otherwise and while a deploy is in `switching` on
+  this server (a moment: the proxy is being changed), with no authentication.
+- **Build servers.** A server labeled `builder` builds for the group: the coordinator sends
+  it the checked-out source (a tar stream, unpacked with path and link checks), the builder
+  runs the build under its own build slot and disk check, and the coordinator fetches the
+  finished image and distributes it as usual. A builder does not need to carry any role
+  label; if one does, it is skipped when images are sent because it already has the image.
+  The builder removes the source and the image afterwards (it keeps the image if that
+  release is live there). A coordinator that is itself a builder builds locally. With
+  several builders the first by name is used; there is no failover to another builder.
+- **Catch-up.** When a rollout or rollback completes, the coordinator records a *final*
+  (app, release, time) and announces it to every server. A server that was down misses the
+  announcement but learns it from its peers when it starts and every 30 seconds after,
+  so a server that was unreachable, was restarted, or joined later converges: if one of
+  its labels matches a role of the app and it is not on that release, it fetches the
+  release's description (config, environment, commit) and image from a peer that has them
+  and deploys it like any other member. It does nothing while a deploy of that app is in
+  progress on it, and it never moves an app back if something newer succeeded here after the
+  final was recorded. A rollback is a new final, so it spreads the same way.
+- **Partial rollouts.** Before distributing, the coordinator pings every target. An
+  unreachable one stops the deploy with a message, unless the app sets `allow_partial: true`
+  (the same for rollback): then it is skipped with a warning and left to catch up.
 - `--network-pool CIDR` makes the agent allocate /24 subnets for app networks from that
   pool; Docker's default pool holds about 30 networks, so about 15 apps. The install
   script configures Docker with 172.80.0.0/12 split into /24s.
 
-**Not done:** a `builder` label for dedicated build servers; `--allow-partial` and servers
-catching up after downtime (a server that was down misses the rollout and only gets the
-next one); Caddy on each server routes only to its own containers, so spreading traffic
+**Not done:** `--allow-partial` as a command-line flag (the config key above covers it);
+no failover to a second builder; catch-up does not apply to apps whose roles carry only
+labels this server lacks, and it only runs for apps that completed a rollout through
+a coordinator (apps deployed before servers were grouped have no final record until their
+next deploy); Caddy on each server routes only to its own containers, so spreading traffic
 across servers needs an external balancer (use the health endpoint); services
 (Postgres/Redis) are refused when a role runs on a server other than the coordinator
 (they would not be reachable), so use an external `DATABASE_URL` secret; secrets are sent
