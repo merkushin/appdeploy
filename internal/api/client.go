@@ -107,8 +107,17 @@ func (c *Client) Status(ctx context.Context, app string) (StatusResponse, error)
 	return out, err
 }
 
-func (c *Client) DeleteApp(ctx context.Context, app string) error {
-	return c.call(ctx, "DELETE", "/v1/apps/"+app, nil, nil)
+// DeleteApp destroys an app. Its volumes are kept (and returned) unless deleteVolumes is set.
+func (c *Client) DeleteApp(ctx context.Context, app string, deleteVolumes bool) ([]string, error) {
+	path := "/v1/apps/" + app
+	if deleteVolumes {
+		path += "?volumes=1"
+	}
+	var out struct {
+		Kept []string `json:"kept_volumes"`
+	}
+	err := c.call(ctx, "DELETE", path, nil, &out)
+	return out.Kept, err
 }
 
 func (c *Client) SetDomains(ctx context.Context, app string, domains []string) error {
@@ -180,6 +189,21 @@ func (c *Client) SetSecrets(ctx context.Context, app string, req SetSecretsReque
 // and returns its final state. If the connection drops, the deploy continues
 // on the server and the caller may call StreamEvents again.
 func (c *Client) StreamEvents(ctx context.Context, id string, out io.Writer) (state, errMsg string, err error) {
+	return c.streamEvents(ctx, id, func(l EventLine) {
+		if !l.Done {
+			fmt.Fprintln(out, l.Msg)
+		}
+	})
+}
+
+// StreamEventsJSON is StreamEvents that writes each entry as one line of JSON,
+// ending with the line {"done":true,"state":...,"error":...}.
+func (c *Client) StreamEventsJSON(ctx context.Context, id string, out io.Writer) (state, errMsg string, err error) {
+	enc := json.NewEncoder(out)
+	return c.streamEvents(ctx, id, func(l EventLine) { _ = enc.Encode(l) })
+}
+
+func (c *Client) streamEvents(ctx context.Context, id string, emit func(EventLine)) (state, errMsg string, err error) {
 	var after int64
 	for {
 		resp, e := c.do(ctx, "GET", "/v1/deploys/"+id+"/events?after="+strconv.FormatInt(after, 10), nil)
@@ -198,12 +222,12 @@ func (c *Client) StreamEvents(ctx context.Context, id string, out io.Writer) (st
 			if json.Unmarshal(sc.Bytes(), &l) != nil {
 				continue
 			}
+			emit(l)
 			if l.Done {
 				resp.Body.Close()
 				return l.State, l.Error, nil
 			}
 			after = l.ID
-			fmt.Fprintln(out, l.Msg)
 		}
 		resp.Body.Close()
 		if ctx.Err() != nil {

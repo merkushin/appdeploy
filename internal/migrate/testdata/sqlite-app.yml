@@ -1,0 +1,41 @@
+# A small Go app with a SQLite database in a volume: one server, one container, data in a volume.
+service: notes_app
+image: example-user/notes_app
+
+servers:
+  web:
+    - 203.0.113.10
+
+registry:
+  server: ghcr.io
+  username: example-user
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: amd64
+
+proxy:
+  host: notes.example.com
+  ssl: true
+  app_port: 8080
+  healthcheck:
+    path: /api/health
+    interval: 3
+    timeout: 5
+
+volumes:
+  - notes_data:/data
+
+env:
+  clear:
+    LISTEN_ADDR: 0.0.0.0:8080
+    BASE_URL: https://notes.example.com
+    DATABASE_PATH: /data/notes.db
+    MAIL_FROM: "Notes <no-reply@notes.example.com>"
+    INVITE_ONLY: "1"
+  secret:
+    - ALLOWED_EMAILS
+    - ADMIN_EMAIL
+    - SMTP_USER
+    - SMTP_PASSWORD

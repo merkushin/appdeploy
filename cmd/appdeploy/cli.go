@@ -70,6 +70,9 @@ func runClient(args []string) int {
 		host = os.Getenv("APPDEPLOY_HOST")
 	}
 	if host != "" {
+		if jsonOut {
+			args = append([]string{"--json"}, args...)
+		}
 		return execSSH(host, args)
 	}
 	return clientRun(socket, args)
@@ -113,13 +116,21 @@ func clientRun(socket string, args []string) int {
 	case "domains":
 		code, err = cmdDomains(ctx, c, rest)
 	case "ping":
-		err = c.Ping(ctx)
+		if err = c.Ping(ctx); err == nil && jsonOut {
+			code, err = emit(map[string]any{"ok": true})
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "appdeploy: unknown command %q\n\n%s", cmd, usage)
 		return 2
 	}
 	if err != nil {
-		return die("%v", err)
+		if err != errReported {
+			die("%v", err)
+		}
+		if code == 2 {
+			return 2 // wrong usage
+		}
+		return 1
 	}
 	return code
 }
@@ -142,12 +153,21 @@ func cmdApps(ctx context.Context, c *api.Client, args []string) (int, error) {
 		if err != nil {
 			return 1, err
 		}
+		if jsonOut {
+			return emit(a)
+		}
 		fmt.Printf("created app %s (deploy branch %s)\n", a.Name, a.Branch)
 		fmt.Printf("  git remote add prod <user>@<server>:%s\n  git push prod %s\n", a.Name, a.Branch)
 	case "list":
 		apps, err := c.ListApps(ctx)
 		if err != nil {
 			return 1, err
+		}
+		if jsonOut {
+			if apps == nil {
+				apps = []api.AppInfo{}
+			}
+			return emit(apps)
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "APP\tRELEASE\tDOMAINS")
@@ -160,13 +180,23 @@ func cmdApps(ctx context.Context, c *api.Client, args []string) (int, error) {
 		}
 		tw.Flush()
 	case "destroy":
-		if len(args) != 2 {
-			return 2, fmt.Errorf("usage: apps destroy <app>")
+		fs := flag.NewFlagSet("apps destroy", flag.ContinueOnError)
+		del := fs.Bool("delete-volumes", false, "also delete the app's volumes: its data is gone for good")
+		pos, err := parseFlags(fs, args[1:])
+		if err != nil || len(pos) != 1 {
+			return 2, fmt.Errorf("usage: apps destroy <app> [--delete-volumes]")
 		}
-		if err := c.DeleteApp(ctx, args[1]); err != nil {
+		kept, err := c.DeleteApp(ctx, pos[0], *del)
+		if err != nil {
 			return 1, err
 		}
-		fmt.Printf("destroyed app %s\n", args[1])
+		if jsonOut {
+			return emit(map[string]any{"ok": true, "kept_volumes": kept})
+		}
+		fmt.Printf("destroyed app %s\n", pos[0])
+		if len(kept) > 0 {
+			fmt.Printf("its data is kept in the volume(s): %s\n(delete them with `docker volume rm` on the server, or destroy with --delete-volumes next time)\n", strings.Join(kept, ", "))
+		}
 	default:
 		return 2, fmt.Errorf("unknown apps command %q", args[0])
 	}
@@ -180,6 +210,9 @@ func cmdStatus(ctx context.Context, c *api.Client, args []string) (int, error) {
 	s, err := c.Status(ctx, args[0])
 	if err != nil {
 		return 1, err
+	}
+	if jsonOut {
+		return emit(s)
 	}
 	rel := "none"
 	if s.App.CurrentRelease > 0 {
@@ -219,6 +252,12 @@ func cmdReleases(ctx context.Context, c *api.Client, args []string) (int, error)
 	rels, err := c.Releases(ctx, args[0])
 	if err != nil {
 		return 1, err
+	}
+	if jsonOut {
+		if rels == nil {
+			rels = []api.ReleaseInfo{}
+		}
+		return emit(rels)
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "RELEASE\tCOMMIT\tCREATED\t")
@@ -284,14 +323,26 @@ func cmdDeploy(ctx context.Context, c *api.Client, kind string, args []string) (
 
 func follow(ctx context.Context, c *api.Client, id string, detach bool) (int, error) {
 	if detach {
+		if jsonOut {
+			return emit(map[string]any{"deploy_id": id})
+		}
 		fmt.Println(id)
 		return 0, nil
 	}
-	state, errMsg, err := c.StreamEvents(ctx, id, os.Stdout)
+	var state, errMsg string
+	var err error
+	if jsonOut {
+		state, errMsg, err = c.StreamEventsJSON(ctx, id, os.Stdout)
+	} else {
+		state, errMsg, err = c.StreamEvents(ctx, id, os.Stdout)
+	}
 	if err != nil {
 		return 1, fmt.Errorf("%v (the deploy continues on the server: deploy id %s)", err, id)
 	}
 	if state != "succeeded" {
+		if jsonOut {
+			return 1, errReported // the final line of the stream already says so
+		}
 		return 1, fmt.Errorf("deploy %s: %s", state, errMsg)
 	}
 	return 0, nil
@@ -354,6 +405,9 @@ func cmdSecrets(ctx context.Context, c *api.Client, args []string) (int, error) 
 			return 1, err
 		}
 		if resp.DeployID == "" {
+			if jsonOut {
+				return emit(map[string]any{"ok": true, "deployed": false})
+			}
 			fmt.Println("secrets updated (not deployed yet: they apply to the next release)")
 			return 0, nil
 		}
@@ -362,6 +416,12 @@ func cmdSecrets(ctx context.Context, c *api.Client, args []string) (int, error) 
 		names, err := c.SecretNames(ctx, app)
 		if err != nil {
 			return 1, err
+		}
+		if jsonOut {
+			if names == nil {
+				names = []string{}
+			}
+			return emit(map[string]any{"names": names})
 		}
 		for _, n := range names {
 			fmt.Println(n)
@@ -392,6 +452,9 @@ func cmdDomains(ctx context.Context, c *api.Client, args []string) (int, error) 
 	if err := c.SetDomains(ctx, args[1], args[2:]); err != nil {
 		return 1, err
 	}
+	if jsonOut {
+		return emit(map[string]any{"ok": true, "domains": args[2:]})
+	}
 	fmt.Printf("domains of %s: %s\n", args[1], strings.Join(args[2:], ", "))
 	return 0, nil
 }
@@ -407,11 +470,20 @@ func cmdDB(ctx context.Context, c *api.Client, args []string) (int, error) {
 		if err != nil {
 			return 1, err
 		}
+		if jsonOut {
+			return emit(map[string]any{"path": path})
+		}
 		fmt.Println("backup written:", path)
 	case "list":
 		names, err := c.DBBackups(ctx, app)
 		if err != nil {
 			return 1, err
+		}
+		if jsonOut {
+			if names == nil {
+				names = []string{}
+			}
+			return emit(names)
 		}
 		for _, n := range names {
 			fmt.Println(n)
@@ -422,6 +494,9 @@ func cmdDB(ctx context.Context, c *api.Client, args []string) (int, error) {
 		}
 		if err := c.DBRestore(ctx, app, args[2]); err != nil {
 			return 1, err
+		}
+		if jsonOut {
+			return emit(map[string]any{"ok": true})
 		}
 		fmt.Println("restored", args[2])
 	default:
@@ -441,6 +516,9 @@ func cmdExport(ctx context.Context, c *api.Client, args []string) (int, error) {
 	files, err := c.Export(ctx, pos[0], *format)
 	if err != nil {
 		return 1, err
+	}
+	if jsonOut && *out == "" {
+		return emit(map[string]any{"files": files})
 	}
 	names := make([]string, 0, len(files))
 	for n := range files {
@@ -480,6 +558,14 @@ func cmdSelfUpdate(ctx context.Context, c *api.Client, args []string) (int, erro
 		return 2, err
 	}
 	res, err := c.SelfUpdate(ctx, *check, *force, *repo)
+	if jsonOut {
+		if err != nil {
+			res.Error = err.Error()
+			emit(res)
+			return 1, errReported
+		}
+		return emit(res)
+	}
 	for _, l := range res.Log {
 		fmt.Println(l)
 	}

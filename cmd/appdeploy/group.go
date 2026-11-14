@@ -68,12 +68,18 @@ func cmdGroup(ctx context.Context, c *api.Client, args []string) (int, error) {
 		if err != nil {
 			return 1, err
 		}
+		if jsonOut {
+			return emit(map[string]any{"token": tok})
+		}
 		fmt.Println("On the new server, run (valid for one hour, once):")
 		fmt.Printf("  appdeploy group join --server <name> --advertise <host:7070> --labels web --token %s\n", tok)
 	case "servers":
 		gv, err := c.GroupVersions(ctx)
 		if err != nil {
 			return 1, err
+		}
+		if jsonOut {
+			return emit(gv)
 		}
 		if gv.Desired != "" {
 			fmt.Printf("desired agent version: %s\n", gv.Desired)
@@ -104,6 +110,9 @@ func cmdGroup(ctx context.Context, c *api.Client, args []string) (int, error) {
 		if err := c.GroupSetVersion(ctx, v); err != nil {
 			return 1, err
 		}
+		if jsonOut {
+			return emit(map[string]any{"ok": true, "version": v})
+		}
 		if v == "" {
 			fmt.Println("no version is wanted any more; servers stay as they are")
 		} else {
@@ -115,6 +124,9 @@ func cmdGroup(ctx context.Context, c *api.Client, args []string) (int, error) {
 		}
 		if err := c.GroupRemove(ctx, args[1]); err != nil {
 			return 1, err
+		}
+		if jsonOut {
+			return emit(map[string]any{"ok": true})
 		}
 		fmt.Println("removed", args[1])
 	default:

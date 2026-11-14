@@ -2,6 +2,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +11,7 @@ import (
 	"syscall"
 
 	"appdeploy/internal/docker"
+	"appdeploy/internal/update"
 )
 
 // Set at build time by the release script: -ldflags "-X main.version=1.2.3 ...".
@@ -27,12 +30,17 @@ Server side:
   appdeploy agent [flags]          run the agent (normally under systemd)
 
 Client side (talks to the agent; --host runs it on a remote server over SSH):
-  appdeploy [--host user@host] [--socket path] <command>
+  appdeploy [--host user@host] [--socket path] [--json] <command>
+
+  --json prints JSON instead of text: lists and objects as one line, deploys as one JSON
+      line per journal entry ending with {"done":true,...}, errors as {"error":"..."}.
 
   ping                             check that the agent answers (no output, exit status 0)
+  check [file] [--json]            validate an appdeploy.yml on this machine, without a server
+  import kamal [deploy.yml] [--secrets file] [--out file] [--force]   turn a Kamal setup into appdeploy.yml and commands (on this machine)
   apps create <app> [--domain d]... [--branch main]
   apps list
-  apps destroy <app>
+  apps destroy <app> [--delete-volumes]
   status [<app>]
   deploy <app> [--ref sha | --image ref [--config appdeploy.yml|-]] [--detach]
   redeploy <app> [--detach]        redeploy the current image with current secrets
@@ -53,11 +61,11 @@ Client side (talks to the agent; --host runs it on a remote server over SSH):
   group set-version <vX.Y.Z|none>  have every server install that release, one at a time
   group remove <name>
   self-update [--check] [--force] [--repo owner/name]   install the latest signed release (admin)
-  version
+  version [--verbose]              --verbose also shows the key this build trusts for updates
 `
 
 func main() {
-	args := os.Args[1:]
+	args := extractJSON(os.Args[1:])
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -69,10 +77,21 @@ func main() {
 		os.Exit(runHook(args[1:]))
 	case "shell":
 		os.Exit(runShell(args[1:]))
+	case "check":
+		os.Exit(runCheck(args[1:]))
+	case "import":
+		os.Exit(runImport(args[1:]))
 	case "recover":
 		os.Exit(runRecover(args[1:]))
 	case "version", "--version":
+		if jsonOut {
+			emitVersion()
+			return
+		}
 		fmt.Println("appdeploy", version)
+		if len(args) > 1 && (args[1] == "--verbose" || args[1] == "-v") {
+			printTrust()
+		}
 		return
 	case "help", "-h", "--help":
 		fmt.Print(usage)
@@ -114,6 +133,29 @@ func shQuote(s string) string {
 func splitCommand(s string) ([]string, error) { return docker.SplitCommand(s) }
 
 func die(format string, a ...any) int {
-	fmt.Fprintf(os.Stderr, "appdeploy: "+format+"\n", a...)
+	reportError(fmt.Sprintf(format, a...))
 	return 1
+}
+
+// emitVersion is `version --json`.
+func emitVersion() {
+	out := map[string]any{"version": version, "update_repository": updateRepo}
+	if pub, err := base64.StdEncoding.DecodeString(updatePublicKey); err == nil && len(pub) == ed25519.PublicKeySize {
+		out["release_key"] = updatePublicKey
+		out["release_key_fingerprint"] = update.Fingerprint(ed25519.PublicKey(pub))
+	}
+	emit(out)
+}
+
+// printTrust shows what this binary trusts: the repository its updates come from
+// and the key they must be signed with, with a fingerprint to compare out of band.
+func printTrust() {
+	fmt.Println("update repository:", updateRepo)
+	pub, err := base64.StdEncoding.DecodeString(updatePublicKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		fmt.Println("release key: none (this build cannot verify updates; it was not made by scripts/release.sh)")
+		return
+	}
+	fmt.Println("release key (ed25519, base64):", updatePublicKey)
+	fmt.Println("release key fingerprint (sha256):", update.Fingerprint(ed25519.PublicKey(pub)))
 }

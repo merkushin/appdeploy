@@ -83,6 +83,10 @@ func runShell(args []string) int {
 	if err != nil || len(words) == 0 {
 		return die("cannot parse command")
 	}
+	words = extractJSON(words)
+	if len(words) == 0 {
+		return die("cannot parse command")
+	}
 	if err := allowed(*role, words); err != nil {
 		return die("%v", err)
 	}
