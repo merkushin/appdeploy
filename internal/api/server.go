@@ -20,6 +20,7 @@ import (
 	"appdeploy/internal/group"
 	"appdeploy/internal/services"
 	"appdeploy/internal/store"
+	"appdeploy/internal/update"
 )
 
 // Server serves the control API.
@@ -28,6 +29,11 @@ type Server struct {
 	St  *store.Store
 	Dk  *docker.Client
 	Svc *services.Manager
+
+	// SelfUpdate installs the latest signed release; set by the agent. AfterUpdate
+	// is called after a successful install, to restart the agent.
+	SelfUpdate  func(ctx context.Context, check, force bool, repo string, log func(string)) (update.Result, error)
+	AfterUpdate func()
 
 	Group *group.Group // nil on a standalone server
 	Peer  *PeerServer  // used to broadcast membership changes
@@ -86,6 +92,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/{app}/db/backups", s.dbBackups)
 	mux.HandleFunc("POST /v1/apps/{app}/db/restore", s.dbRestore)
 	mux.HandleFunc("GET /v1/apps/{app}/export", s.export)
+	mux.HandleFunc("POST /v1/self-update", s.selfUpdate)
 	mux.HandleFunc("GET /v1/group", s.groupInfo)
 	mux.HandleFunc("POST /v1/group/invite", s.groupInvite)
 	mux.HandleFunc("DELETE /v1/group/servers/{name}", s.groupRemove)
@@ -743,4 +750,43 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"files": files})
+}
+
+// ---- self-update ----
+
+func (s *Server) selfUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Check bool   `json:"check"`
+		Force bool   `json:"force"`
+		Repo  string `json:"repo"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.SelfUpdate == nil {
+		writeErr(w, errors.New("this agent cannot update itself"))
+		return
+	}
+	var lines []string
+	reply := func(res update.Result, err error) {
+		out := UpdateResult{Log: lines, From: res.From, To: res.To, Updated: res.Updated}
+		if err != nil {
+			out.Error = err.Error()
+		}
+		writeJSON(w, 200, out)
+	}
+	if !req.Check && !req.Force {
+		// Restarting the agent interrupts the step of a running deploy; it resumes afterwards,
+		// but a quiet moment is better.
+		if un, _ := s.St.UnfinishedDeploys(); len(un) > 0 {
+			reply(update.Result{}, fmt.Errorf("%d deploy(s) are in progress; try again when they are done, or use --force", len(un)))
+			return
+		}
+	}
+	res, err := s.SelfUpdate(r.Context(), req.Check, req.Force, req.Repo, func(l string) { lines = append(lines, l) })
+	reply(res, err)
+	if err == nil && res.Updated && s.AfterUpdate != nil {
+		s.AfterUpdate()
+	}
 }

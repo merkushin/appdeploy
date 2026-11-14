@@ -294,6 +294,26 @@ func (c *Client) GroupRemove(ctx context.Context, name string) error {
 	return c.call(ctx, "DELETE", "/v1/group/servers/"+name, nil, nil)
 }
 
+// UpdateResult is the outcome of a self-update.
+type UpdateResult struct {
+	Log     []string `json:"log"`
+	From    string   `json:"from"`
+	To      string   `json:"to"`
+	Updated bool     `json:"updated"`
+	Error   string   `json:"error,omitempty"`
+}
+
+// SelfUpdate asks the agent to install the latest signed release. On success the
+// agent restarts itself shortly afterwards.
+func (c *Client) SelfUpdate(ctx context.Context, check, force bool, repo string) (UpdateResult, error) {
+	var out UpdateResult
+	err := c.call(ctx, "POST", "/v1/self-update", map[string]any{"check": check, "force": force, "repo": repo}, &out)
+	if err == nil && out.Error != "" {
+		err = errors.New(out.Error)
+	}
+	return out, err
+}
+
 // Export returns the files of the app's configuration for another tool, by path.
 func (c *Client) Export(ctx context.Context, app, format string) (map[string]string, error) {
 	var out struct {

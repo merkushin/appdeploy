@@ -11,7 +11,12 @@ import (
 	"appdeploy/internal/docker"
 )
 
-const version = "0.1.0-m1"
+// Set at build time by the release script: -ldflags "-X main.version=1.2.3 ...".
+var (
+	version         = "dev"
+	updateRepo      = "merkushin/appdeploy" // GitHub repository that publishes releases
+	updatePublicKey = ""                    // base64 ed25519 key the releases are signed with
+)
 
 const defaultSocket = "/run/appdeploy/agent.sock"
 const defaultDataDir = "/var/lib/appdeploy"
@@ -45,6 +50,7 @@ Client side (talks to the agent; --host runs it on a remote server over SSH):
   group init|join ...              create a group of servers / join one (before starting the agent)
   group invite|servers             invite a server / list members
   group remove <name>
+  self-update [--check] [--force] [--repo owner/name]   install the latest signed release (admin)
   version
 `
 

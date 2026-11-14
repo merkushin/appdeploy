@@ -103,6 +103,8 @@ func clientRun(socket string, args []string) int {
 		code, err = cmdSecrets(ctx, c, rest)
 	case "group":
 		code, err = cmdGroup(ctx, c, rest)
+	case "self-update":
+		code, err = cmdSelfUpdate(ctx, c, rest)
 	case "export":
 		code, err = cmdExport(ctx, c, rest)
 	case "db":
@@ -458,6 +460,27 @@ func cmdExport(ctx context.Context, c *api.Client, args []string) (int, error) {
 			return 1, err
 		}
 		fmt.Println("wrote", path)
+	}
+	return 0, nil
+}
+
+func cmdSelfUpdate(ctx context.Context, c *api.Client, args []string) (int, error) {
+	fs := flag.NewFlagSet("self-update", flag.ContinueOnError)
+	check := fs.Bool("check", false, "only report whether a newer release exists")
+	force := fs.Bool("force", false, "install even if it is not newer, and even while deploys are running")
+	repo := fs.String("repo", "", "owner/name of the GitHub repository (default: the one this build was made for)")
+	if _, err := parseFlags(fs, args); err != nil {
+		return 2, err
+	}
+	res, err := c.SelfUpdate(ctx, *check, *force, *repo)
+	for _, l := range res.Log {
+		fmt.Println(l)
+	}
+	if err != nil {
+		return 1, err
+	}
+	if res.Updated {
+		fmt.Printf("updated %s -> %s; the agent restarts now (deploys in progress resume)\n", res.From, res.To)
 	}
 	return 0, nil
 }

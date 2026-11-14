@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -26,6 +29,7 @@ import (
 	"appdeploy/internal/services"
 	"appdeploy/internal/store"
 	"appdeploy/internal/traffic"
+	"appdeploy/internal/update"
 )
 
 func runAgent(args []string) int {
@@ -47,6 +51,8 @@ func runAgent(args []string) int {
 	networkPool := fs.String("network-pool", "", "CIDR to allocate /24 subnets for app networks from, instead of Docker's small default pool (e.g. 172.80.0.0/12)")
 	healthListen := fs.String("health-listen", "", "address for GET /health/<app>, a status-only endpoint for load balancers (off by default)")
 	monitorEvery := fs.Duration("monitor-every", 30*time.Second, "how often to look for crashed containers and low disk space (0 = never)")
+	updateRepoFlag := fs.String("update-repo", updateRepo, "GitHub repository (owner/name) that publishes releases for self-update")
+	updateAPI := fs.String("update-api", "", "GitHub API URL for self-update (default https://api.github.com; for tests)")
 	peerListen := fs.String("peer-listen", "", "address of the peer API (default: the port of this server's advertised address)")
 	backupEvery := fs.Duration("backup-every", 24*time.Hour, "back up every app's Postgres database this often (0 = never)")
 	var notifyURLs stringList
@@ -146,6 +152,24 @@ func runAgent(args []string) int {
 		defer hsrv.Close()
 	}
 	ctl := &api.Server{Eng: eng, St: st, Dk: dk, Svc: svc, Group: grp}
+	ctl.SelfUpdate = func(uctx context.Context, check, force bool, repo string, logf func(string)) (update.Result, error) {
+		pub, perr := base64.StdEncoding.DecodeString(updatePublicKey)
+		if repo == "" {
+			repo = *updateRepoFlag
+		}
+		exe, _ := os.Executable()
+		if perr != nil || len(pub) != ed25519.PublicKeySize {
+			return update.Result{}, errors.New("this binary was built without a release signing key, so it cannot verify updates")
+		}
+		return update.Run(uctx, update.Options{
+			API: *updateAPI, Repo: repo, PublicKey: ed25519.PublicKey(pub), Current: version,
+			OS: runtime.GOOS, Arch: runtime.GOARCH, Exe: exe, Force: force, CheckOnly: check,
+			Token: os.Getenv("APPDEPLOY_UPDATE_TOKEN"),
+			Log:   func(format string, a ...any) { logf(fmt.Sprintf(format, a...)) },
+		})
+	}
+	// The service manager starts the new binary: exit cleanly once the reply is out.
+	ctl.AfterUpdate = func() { time.AfterFunc(time.Second, stop) }
 	srv := &http.Server{Handler: ctl.Handler()}
 	if grp != nil {
 		peer := &api.PeerServer{Ctl: ctl, Group: grp}
