@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -19,10 +20,14 @@ import (
 // member is one simulated server: its own agent, data directory and Docker
 // name prefix, sharing the Docker daemon (and the machine) with the others.
 type member struct {
-	name, instance, dataDir, socket, peerAddr, labels, pool string
-	cmd                                                     *exec.Cmd
-	done                                                    chan struct{}
-	client                                                  *api.Client
+	name, instance, dataDir, socket, peerAddr, labels, pool, bin string
+	client                                                       *api.Client
+
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	done       chan struct{}
+	stopping   bool
+	supervised bool
 }
 
 type groupEnv struct {
@@ -33,28 +38,48 @@ var theGroup *groupEnv
 
 func (m *member) args() []string {
 	return []string{"agent", "--data-dir", m.dataDir, "--socket", m.socket, "--instance", m.instance,
-		"--caddy-admin", "none", "--min-free-bytes", "1", "--min-free-frac", "0.0001", "--default-watch-window", "3s", "--network-pool", m.pool}
+		"--caddy-admin", "none", "--min-free-bytes", "1", "--min-free-frac", "0.0001", "--default-watch-window", "3s", "--network-pool", m.pool,
+		// Updates come from the fake GitHub; members check often and confirm quickly.
+		"--update-api", env.gh.URL(), "--update-check-every", "1s", "--update-confirm-after", "2s"}
+}
+
+// spawn starts the agent process of the member (from its own copy of the binary).
+func (m *member) spawn() error {
+	logf, err := os.OpenFile(filepath.Join(m.dataDir, "..", m.name+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(m.bin, m.args()...)
+	cmd.Stdout, cmd.Stderr = logf, logf
+	if err := cmd.Start(); err != nil {
+		logf.Close()
+		return err
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); logf.Close(); close(done) }()
+	m.mu.Lock()
+	m.cmd, m.done = cmd, done
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *member) start(t testing.TB) {
 	t.Helper()
-	logf, err := os.OpenFile(filepath.Join(m.dataDir, "..", m.name+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
+	m.mu.Lock()
+	m.stopping = false
+	m.mu.Unlock()
+	if err := m.spawn(); err != nil {
 		t.Fatal(err)
 	}
-	m.cmd = exec.Command(env.bin, m.args()...)
-	m.cmd.Stdout, m.cmd.Stderr = logf, logf
-	if err := m.cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	m.done = make(chan struct{})
-	go func(c *exec.Cmd, done chan struct{}) { _ = c.Wait(); logf.Close(); close(done) }(m.cmd, m.done)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		err := m.client.Ping(ctx)
 		cancel()
 		if err == nil {
+			if m.supervised {
+				go m.supervise()
+			}
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -62,18 +87,49 @@ func (m *member) start(t testing.TB) {
 	t.Fatalf("agent %s did not start", m.name)
 }
 
+// supervise does what the service manager does: when the agent exits (as it does
+// after installing an update), run `recover` and start it again.
+func (m *member) supervise() {
+	for {
+		m.mu.Lock()
+		done, stopping := m.done, m.stopping
+		m.mu.Unlock()
+		if stopping || done == nil {
+			return
+		}
+		<-done
+		m.mu.Lock()
+		stopping = m.stopping
+		m.mu.Unlock()
+		if stopping {
+			return
+		}
+		_, _ = sh(m.bin, "recover", "--data-dir", m.dataDir)
+		time.Sleep(200 * time.Millisecond)
+		if err := m.spawn(); err != nil {
+			return
+		}
+	}
+}
+
 func (m *member) stop(sig syscall.Signal) {
-	if m.cmd == nil || m.cmd.Process == nil {
+	m.mu.Lock()
+	m.stopping = true
+	cmd, done := m.cmd, m.done
+	m.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = m.cmd.Process.Signal(sig)
+	_ = cmd.Process.Signal(sig)
 	select {
-	case <-m.done:
+	case <-done:
 	case <-time.After(30 * time.Second):
-		_ = m.cmd.Process.Kill()
-		<-m.done
+		_ = cmd.Process.Kill()
+		<-done
 	}
+	m.mu.Lock()
 	m.cmd = nil
+	m.mu.Unlock()
 }
 
 func (m *member) cli(args ...string) (string, error) {
@@ -97,6 +153,11 @@ func needGroup(t *testing.T) *groupEnv {
 			dataDir: filepath.Join(root, name, "data"), socket: filepath.Join(root, name+".sock")}
 		_ = os.MkdirAll(m.dataDir, 0o755)
 		m.client = api.NewClient(m.socket)
+		// Each member runs its own copy of the binary, so that updating one leaves the others alone.
+		m.bin = filepath.Join(root, name, "appdeploy")
+		if b, err := os.ReadFile(env.bin); err != nil || os.WriteFile(m.bin, b, 0o755) != nil {
+			t.Fatalf("copying the binary: %v", err)
+		}
 		return m
 	}
 	g := &groupEnv{a: mk("a", "web,db"), b: mk("b", "web"), c: mk("c", "worker"), d: mk("d", "builder")}
@@ -128,6 +189,12 @@ func needGroup(t *testing.T) *groupEnv {
 	}
 	mustGroup("group", "init", "--data-dir", g.a.dataDir, "--group", "prod", "--server", "a", "--advertise", g.a.peerAddr, "--labels", g.a.labels)
 	g.a.start(t)
+	defer func() {
+		for _, m := range []*member{g.a, g.b, g.c, g.d} {
+			m.supervised = true
+			go m.supervise()
+		}
+	}()
 	for _, m := range []*member{g.b, g.c, g.d} {
 		out, err := g.a.cli("group", "invite")
 		if err != nil {
@@ -435,5 +502,104 @@ func TestGroupServerCatchesUpAfterDowntime(t *testing.T) {
 	// The build server carries no role label, so it catches up with nothing.
 	if got := g.d.roles(t, "gcatch"); !strings.HasPrefix(got, "none running") {
 		t.Errorf("the builder runs %q", got)
+	}
+}
+
+// The founder names a release; every server installs it by itself, one after the
+// other in name order, while the apps keep running.
+func TestGroupRollingUpdate(t *testing.T) {
+	g := needGroup(t)
+	members := []*member{g.a, g.b, g.c, g.d}
+
+	// An app that must stay up through the whole thing.
+	g.a.newApp(t, "gupd")
+	r := env.newRepo(t, "hello")
+	r.write("appdeploy.yml", groupConfig)
+	r.commit("v1")
+	if out, err := r.gpush(g.a, "gupd"); err != nil || !strings.Contains(out, "==> succeeded") {
+		t.Fatalf("v1: %v\n%s", err, out)
+	}
+	g.a.expectWeb(t, "gupd", "hello v1")
+
+	// Only the founder decides, and only a real version will do.
+	if out, err := g.b.cli("group", "set-version", "v9.9.9"); err == nil {
+		t.Errorf("a member set the version: %s", out)
+	}
+	if out, err := g.a.cli("group", "set-version", "latest"); err == nil || !strings.Contains(out, "not a version") {
+		t.Errorf("a malformed version: %v %s", err, out)
+	}
+
+	newBin := filepath.Join(t.TempDir(), "appdeploy-9.9.9")
+	if out, err := env.buildBinary(newBin, "9.9.9"); err != nil {
+		t.Fatalf("building 9.9.9: %v\n%s", err, out)
+	}
+	bin, _ := os.ReadFile(newBin)
+	env.gh.publish("v9.9.9", bin, env.updKey)
+
+	// Note when each server's binary turns into the new version.
+	seen := map[string]time.Time{}
+	var mu sync.Mutex
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, m := range members {
+		m := m
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				if out, _ := sh(m.bin, "version"); out == "appdeploy 9.9.9" {
+					mu.Lock()
+					seen[m.name] = time.Now()
+					mu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	if out, err := g.a.cli("group", "set-version", "v9.9.9"); err != nil {
+		t.Fatalf("set-version: %v\n%s", err, out)
+	}
+	waitFor(t, 3*time.Minute, "every server to run 9.9.9", func() bool {
+		gv, err := g.d.client.GroupVersions(context.Background())
+		if err != nil || gv.Desired != "v9.9.9" || len(gv.Servers) != 4 {
+			return false
+		}
+		for _, s := range gv.Servers {
+			if !s.Reachable || s.Version != "9.9.9" {
+				return false
+			}
+		}
+		return true
+	})
+	close(stop)
+	wg.Wait()
+
+	// They went one at a time, in name order.
+	mu.Lock()
+	defer mu.Unlock()
+	for _, pair := range [][2]string{{"a", "b"}, {"b", "c"}, {"c", "d"}} {
+		first, second := seen[pair[0]], seen[pair[1]]
+		if first.IsZero() || second.IsZero() || !first.Before(second) {
+			t.Errorf("%s was updated at %v and %s at %v: not in order", pair[0], first, pair[1], second)
+		}
+	}
+	// The app never went away, and the group still works with the new version.
+	g.a.expectWeb(t, "gupd", "hello v1")
+	g.b.expectWeb(t, "gupd", "hello v1")
+	out, _ := g.a.cli("group", "servers")
+	contains(t, out, "9.9.9")
+	r.write("message.txt", "hello v2\n")
+	r.commit("v2 after the update")
+	if out, err := r.gpush(g.a, "gupd"); err != nil || !strings.Contains(out, "==> succeeded") {
+		t.Fatalf("a rollout after the update: %v\n%s", err, out)
+	}
+	g.a.expectWeb(t, "gupd", "hello v2")
+	if out, err := g.a.cli("group", "set-version", "none"); err != nil {
+		t.Errorf("clearing the version: %v %s", err, out)
 	}
 }

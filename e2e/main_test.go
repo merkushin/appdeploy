@@ -172,7 +172,7 @@ func (e *testEnv) agentArgs() []string {
 		"--upstream-host", "host.docker.internal",
 		"--min-free-bytes", "1", "--min-free-frac", "0.0001",
 		"--network-pool", "10.81.0.0/20", "--health-listen", e.healthAddr,
-		"--monitor-every", "2s", "--update-api", e.gh.URL(),
+		"--monitor-every", "2s", "--update-api", e.gh.URL(), "--update-confirm-after", "2s",
 		// The watchdog reads the access log Caddy writes into a shared directory.
 		"--access-log", filepath.Join(e.root, "caddylogs", "access.log"),
 		"--caddy-access-log", "/var/log/caddy/access.log",
@@ -514,8 +514,8 @@ func freeAddr() string {
 
 // buildBinary builds the appdeploy binary as the given version. It trusts the
 // run's signing key and looks for releases of acme/tool.
-func (e *testEnv) buildBinary(path, version string) (string, error) {
+func (e *testEnv) buildBinary(path, version string, extraLdflags ...string) (string, error) {
 	pub := base64.StdEncoding.EncodeToString(e.updKey.Public().(ed25519.PublicKey))
-	ldflags := fmt.Sprintf("-X main.version=%s -X main.updatePublicKey=%s -X main.updateRepo=acme/tool", version, pub)
+	ldflags := strings.Join(append([]string{fmt.Sprintf("-X main.version=%s -X main.updatePublicKey=%s -X main.updateRepo=acme/tool", version, pub)}, extraLdflags...), " ")
 	return sh("go", "build", "-ldflags", ldflags, "-o", path, filepath.Join(e.repoRoot, "cmd", "appdeploy"))
 }
