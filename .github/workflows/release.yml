@@ -2,8 +2,8 @@
 #
 # One-time setup (see scripts/release.sh):
 #   go run ./cmd/releasetool keygen -out release.key      # keep release.key secret and backed up
-#   repository secret   RELEASE_SIGNING_KEY = the contents of release.key
-#   repository variable RELEASE_PUBLIC_KEY  = the public key keygen printed
+#   repository secret RELEASE_SIGNING_KEY = the contents of release.key
+# Nothing else is needed: the public key the binaries trust is derived from that secret.
 name: release
 
 on:
@@ -29,7 +29,6 @@ jobs:
       - name: Build, checksum and sign
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
           REPO: ${{ github.repository }}
         run: scripts/release.sh "$GITHUB_REF_NAME"
       - name: Publish
