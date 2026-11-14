@@ -417,7 +417,12 @@ appdeploy export <app> --format kamal|compose|k8s|fly
 appdeploy self-update
 ```
 
-The target server is taken from the current repository's git remote or the `--host` flag.
+The client finds its server in this order: `--host` (an address or a name), `APPDEPLOY_HOST`,
+`host:` or a single entry of `hosts:` in the `appdeploy.yml` of the current directory, the git
+remote `appdeploy` or `prod` of the current repository, the default of `appdeploy hosts` (a file
+in the user's configuration directory), else the local agent. Only the client uses them; the agent
+ignores `host` and `hosts`. A server found in a file or a remote is announced on stderr, and an
+address that ssh could read as an option is refused.
 
 ## 16. Agent-to-agent protocol
 

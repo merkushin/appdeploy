@@ -19,6 +19,10 @@ git remote add prod deploy@my-server:myapp
 git push prod main
 ```
 
+Inside that repository the later commands (`appdeploy status myapp`, `appdeploy logs myapp -f`)
+find the server from the `prod` remote, so `--host` is not needed again; see
+[Commands](docs/commands.md#choosing-the-server).
+
 ```
 remote: ==> validating
 remote: ==> building
