@@ -897,3 +897,67 @@ func TestExportToOtherTools(t *testing.T) {
 		t.Errorf("app without a release: %v %s", err, out)
 	}
 }
+
+// Each SSH key has a role, set by the forced command in authorized_keys.
+func TestSSHRoles(t *testing.T) {
+	e := env
+	dir := t.TempDir()
+	ssh := func(role string) string {
+		path := filepath.Join(dir, "ssh-"+role)
+		script := fmt.Sprintf("#!/bin/sh\nfor last; do :; done\nexport SSH_ORIGINAL_COMMAND=\"$last\" APPDEPLOY_SOCKET=%q APPDEPLOY_DATA_DIR=%q\nPATH=\"$(git --exec-path):$PATH\"\nexec %q shell --role %s\n",
+			e.socket, e.dataDir, e.bin, role)
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	run := func(role, cmd string) (string, error) { return sh(ssh(role), "deploy@testhost", cmd) }
+
+	e.newApp(t, "roles", "roles.test")
+	r := e.newRepo(t, "hello")
+	push := func(role string) (string, error) {
+		cmd := exec.Command("git", "push", "--force", "deploy@testhost:roles", "HEAD:refs/heads/main")
+		cmd.Dir = r.dir
+		cmd.Env = append(os.Environ(), "GIT_SSH_COMMAND="+ssh(role))
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// A viewer sees but cannot touch.
+	if out, err := push("viewer"); err == nil || !strings.Contains(out, "not allowed for the viewer role") {
+		t.Fatalf("a viewer pushed: %v\n%s", err, out)
+	}
+	for _, cmd := range []string{"deploy roles", "logs roles", "secrets set roles A=1", "secrets list roles", "exec roles -- id", "apps destroy roles", "export roles --format fly"} {
+		if out, err := run("viewer", cmd); err == nil || !strings.Contains(out, "not allowed for the viewer role") {
+			t.Errorf("viewer ran %q: %v %s", cmd, err, out)
+		}
+	}
+	if out, err := run("viewer", "status roles"); err != nil {
+		t.Errorf("viewer status: %v %s", err, out)
+	}
+
+	// A deployer ships code and can roll back, but cannot read or change secrets, or exec.
+	out, err := push("deployer")
+	if err != nil || !strings.Contains(out, "==> succeeded") {
+		t.Fatalf("a deployer could not push: %v\n%s", err, out)
+	}
+	e.expectBody(t, "roles.test", "/", "hello v1")
+	for _, cmd := range []string{"secrets set roles A=1", "secrets export roles", "exec roles -- id", "apps create other", "domains set roles x.test", "db backup roles", "group invite", "export roles --format kamal"} {
+		if out, err := run("deployer", cmd); err == nil || !strings.Contains(out, "not allowed for the deployer role") {
+			t.Errorf("deployer ran %q: %v %s", cmd, err, out)
+		}
+	}
+	for _, cmd := range []string{"status roles", "releases roles", "logs roles --tail 3", "secrets list roles"} {
+		if out, err := run("deployer", cmd); err != nil {
+			t.Errorf("deployer %q: %v %s", cmd, err, out)
+		}
+	}
+
+	// An admin can do it all, and a role that does not exist is refused outright.
+	if out, err := run("admin", "secrets set roles A=1 --no-deploy"); err != nil {
+		t.Errorf("admin: %v %s", err, out)
+	}
+	if out, err := run("root", "status"); err == nil || !strings.Contains(out, "unknown role") {
+		t.Errorf("an unknown role: %v %s", err, out)
+	}
+}

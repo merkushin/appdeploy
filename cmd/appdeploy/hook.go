@@ -66,6 +66,14 @@ func runHook(args []string) int {
 // runShell is the SSH forced command. It allows git pushes/fetches of app
 // repositories and appdeploy client commands, and nothing else.
 func runShell(args []string) int {
+	fs := flag.NewFlagSet("shell", flag.ContinueOnError)
+	role := fs.String("role", roleAdmin, "what this SSH key may do: viewer, deployer or admin")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if !validRole(*role) {
+		return die("unknown role %q (use viewer, deployer or admin)", *role)
+	}
 	orig := os.Getenv("SSH_ORIGINAL_COMMAND")
 	if orig == "" {
 		fmt.Fprintln(os.Stderr, "appdeploy: interactive shells are not available; use git push or an appdeploy command")
@@ -74,6 +82,9 @@ func runShell(args []string) int {
 	words, err := splitCommand(orig)
 	if err != nil || len(words) == 0 {
 		return die("cannot parse command")
+	}
+	if err := allowed(*role, words); err != nil {
+		return die("%v", err)
 	}
 	dataDir := envOr("APPDEPLOY_DATA_DIR", defaultDataDir)
 	switch words[0] {

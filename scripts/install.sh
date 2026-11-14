@@ -15,7 +15,9 @@
 set -euo pipefail
 
 BINARY=""
-SSH_KEYS=()
+SSH_KEYS=()       # admin: may do everything
+DEPLOY_KEYS=()    # deployer: git push, deploy, rollback, logs
+VIEW_KEYS=()      # viewer: status and lists only
 
 usage() {
   sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -26,6 +28,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
     --ssh-key) SSH_KEYS+=("${2:?--ssh-key needs a public key}"); shift 2 ;;
+    --deployer-key) DEPLOY_KEYS+=("${2:?--deployer-key needs a public key}"); shift 2 ;;
+    --viewer-key) VIEW_KEYS+=("${2:?--viewer-key needs a public key}"); shift 2 ;;
     --ssh-key-file)
       while IFS= read -r line; do [ -n "$line" ] && SSH_KEYS+=("$line"); done < "${2:?--ssh-key-file needs a path}"
       shift 2 ;;
@@ -40,7 +44,7 @@ die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root"
 [ -n "$BINARY" ] || die "--binary <path to the linux appdeploy binary> is required"
 [ -f "$BINARY" ] || die "no such file: $BINARY"
-[ "${#SSH_KEYS[@]}" -gt 0 ] || die "give at least one --ssh-key or --ssh-key-file"
+[ "${#SSH_KEYS[@]}" -gt 0 ] || die "give at least one admin key with --ssh-key or --ssh-key-file"
 command -v systemctl >/dev/null || die "systemd is required"
 command -v apt-get >/dev/null || die "only Debian/Ubuntu (apt) is supported for now"
 
@@ -91,9 +95,16 @@ usermod -p '*' deploy
 install -d -m 0700 -o deploy -g appdeploy /home/deploy/.ssh
 AUTH=/home/deploy/.ssh/authorized_keys
 : > "$AUTH.new"
-for key in "${SSH_KEYS[@]}"; do
-  printf 'command="/usr/local/bin/appdeploy shell",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s\n' "$key" >> "$AUTH.new"
-done
+write_keys() { # write_keys <role> <keys...>
+  local role="$1"; shift
+  local key
+  for key in "$@"; do
+    printf 'command="/usr/local/bin/appdeploy shell --role %s",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s\n' "$role" "$key" >> "$AUTH.new"
+  done
+}
+write_keys admin "${SSH_KEYS[@]}"
+[ "${#DEPLOY_KEYS[@]}" -eq 0 ] || write_keys deployer "${DEPLOY_KEYS[@]}"
+[ "${#VIEW_KEYS[@]}" -eq 0 ] || write_keys viewer "${VIEW_KEYS[@]}"
 chown deploy:appdeploy "$AUTH.new"
 chmod 0600 "$AUTH.new"
 mv "$AUTH.new" "$AUTH"
@@ -171,8 +182,10 @@ Next steps
        git remote add prod deploy@<server>:myapp
        git push prod main
   3. Firewall: this script does not change it. Allow 22, 80 and 443 only.
-  4. Anyone with a key in /home/deploy/.ssh/authorized_keys can deploy, read
-     logs, exec into containers and export secrets (per-key roles come later).
+  4. Keys given with --ssh-key are admins (everything, including exec and secrets).
+     --deployer-key may git push, deploy, roll back and read logs; --viewer-key
+     only sees status and lists. The role is set per key in
+     /home/deploy/.ssh/authorized_keys.
 EOF
     exit 0
   fi
