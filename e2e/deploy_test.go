@@ -1014,3 +1014,66 @@ func TestDeployPrebuiltImage(t *testing.T) {
 		t.Errorf("a missing config file was accepted: %s", out)
 	}
 }
+
+// A container that dies after the deploy checks passed is reported.
+func TestCrashedContainerIsReported(t *testing.T) {
+	e := env
+	var mu sync.Mutex
+	var got []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		if json.Unmarshal(b, &m) == nil {
+			mu.Lock()
+			got = append(got, m)
+			mu.Unlock()
+		}
+	}))
+	defer srv.Close()
+	count := func(event string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, m := range got {
+			if m["event"] == event {
+				n++
+			}
+		}
+		return n
+	}
+
+	e.newApp(t, "mon", "mon.test")
+	r := e.newRepo(t, "hello")
+	r.write("appdeploy.yml", "notify: ["+srv.URL+"/hook]\n")
+	r.commit("with webhook")
+	if out, err := r.push("mon"); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	// Quiet while everything runs.
+	time.Sleep(5 * time.Second)
+	if n := count("app.crashed"); n != 0 {
+		t.Fatalf("%d app.crashed events for a healthy app", n)
+	}
+	for _, c := range e.containers("mon") {
+		if out, err := sh("docker", "kill", c); err != nil {
+			t.Fatalf("docker kill: %v %s", err, out)
+		}
+	}
+	waitFor(t, 30*time.Second, "an app.crashed event", func() bool { return count("app.crashed") >= 1 })
+	mu.Lock()
+	var ev map[string]any
+	for _, m := range got {
+		if m["event"] == "app.crashed" {
+			ev = m
+		}
+	}
+	mu.Unlock()
+	if ev["app"] != "mon" || !strings.Contains(fmt.Sprint(ev["error"]), "-mon-v1-web-1") {
+		t.Errorf("event: %v", ev)
+	}
+	// One incident, one alert (the cooldown keeps a flapping container quiet).
+	time.Sleep(6 * time.Second)
+	if n := count("app.crashed"); n != 1 {
+		t.Errorf("%d alerts for one crash, want 1", n)
+	}
+}

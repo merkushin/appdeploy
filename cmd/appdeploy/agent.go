@@ -46,6 +46,7 @@ func runAgent(args []string) int {
 	pruneCache := fs.Duration("prune-build-cache", 0, "after each deploy, remove Docker build cache unused for this long (e.g. 168h); off by default because the cache is shared with everything else using this Docker")
 	networkPool := fs.String("network-pool", "", "CIDR to allocate /24 subnets for app networks from, instead of Docker's small default pool (e.g. 172.80.0.0/12)")
 	healthListen := fs.String("health-listen", "", "address for GET /health/<app>, a status-only endpoint for load balancers (off by default)")
+	monitorEvery := fs.Duration("monitor-every", 30*time.Second, "how often to look for crashed containers and low disk space (0 = never)")
 	peerListen := fs.String("peer-listen", "", "address of the peer API (default: the port of this server's advertised address)")
 	backupEvery := fs.Duration("backup-every", 24*time.Hour, "back up every app's Postgres database this often (0 = never)")
 	var notifyURLs stringList
@@ -171,6 +172,9 @@ func runAgent(args []string) int {
 		// A proxy that is down must not stop the agent: apps keep running and
 		// the next deploy re-applies the routes.
 		log.Printf("recovery: %v", err)
+	}
+	if *monitorEvery > 0 {
+		go eng.RunMonitor(ctx, *monitorEvery)
 	}
 	if grp != nil {
 		go eng.RunCatchUp(ctx, 30*time.Second)

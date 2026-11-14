@@ -163,6 +163,7 @@ func (e *testEnv) agentArgs() []string {
 		"--upstream-host", "host.docker.internal",
 		"--min-free-bytes", "1", "--min-free-frac", "0.0001",
 		"--network-pool", "10.81.0.0/20", "--health-listen", e.healthAddr,
+		"--monitor-every", "2s",
 		// The watchdog reads the access log Caddy writes into a shared directory.
 		"--access-log", filepath.Join(e.root, "caddylogs", "access.log"),
 		"--caddy-access-log", "/var/log/caddy/access.log",

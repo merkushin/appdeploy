@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"appdeploy/internal/docker"
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
@@ -10,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEnvFileRoundTrip(t *testing.T) {
@@ -234,5 +236,70 @@ func TestTarRoundTripAndHostileArchives(t *testing.T) {
 		if err := evil(f); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+func TestAlerterReportsOneIncidentOnce(t *testing.T) {
+	a := newAlerter()
+	t0 := time.Unix(1_000_000, 0)
+	up := docker.State{Running: true}
+	if m := a.container("c", up, t0); m != "" {
+		t.Errorf("a healthy container alerted: %q", m)
+	}
+	// A crash that Docker already healed shows as a higher restart count.
+	if m := a.container("c", docker.State{Running: true, RestartCount: 1}, t0.Add(time.Minute)); !strings.Contains(m, "crashed and was restarted") {
+		t.Errorf("restart: %q", m)
+	}
+	// Further crashes within the cooldown stay quiet; after it they are reported again.
+	if m := a.container("c", docker.State{Running: true, RestartCount: 2}, t0.Add(2*time.Minute)); m != "" {
+		t.Errorf("repeated alert within the cooldown: %q", m)
+	}
+	if m := a.container("c", docker.State{Running: true, RestartCount: 3}, t0.Add(time.Minute+alertCooldown+time.Second)); m == "" {
+		t.Errorf("no alert after the cooldown")
+	}
+	// A stopped container is reported once, and again only after it ran in between.
+	a = newAlerter()
+	down := docker.State{ExitCode: 137, OOMKilled: true}
+	if m := a.container("d", down, t0); !strings.Contains(m, "not running (exit code 137)") || !strings.Contains(m, "memory limit") {
+		t.Errorf("down: %q", m)
+	}
+	if m := a.container("d", down, t0.Add(time.Hour)); m != "" {
+		t.Errorf("the same outage was reported twice: %q", m)
+	}
+	a.container("d", up, t0.Add(2*time.Hour))
+	if m := a.container("d", down, t0.Add(3*time.Hour)); m == "" {
+		t.Errorf("a new outage was not reported")
+	}
+	// A crash loop reports as such.
+	if m := newAlerter().container("e", docker.State{Restarting: true, RestartCount: 4}, t0); !strings.Contains(m, "restarting repeatedly") {
+		t.Errorf("crash loop: %q", m)
+	}
+	// Forgotten containers start fresh.
+	a.forget(map[string]bool{})
+	if len(a.restarts)+len(a.down)+len(a.last) != 0 {
+		t.Errorf("state was kept for a removed container")
+	}
+}
+
+func TestAlerterDiskHasHysteresis(t *testing.T) {
+	a := newAlerter()
+	const gb = 1 << 30
+	if m := a.disk(50*gb, 100*gb, 5*gb, 0.10); m != "" {
+		t.Errorf("plenty of space: %q", m)
+	}
+	if m := a.disk(4*gb, 100*gb, 5*gb, 0.10); !strings.Contains(m, "free of") {
+		t.Errorf("low space: %q", m)
+	}
+	if m := a.disk(3*gb, 100*gb, 5*gb, 0.10); m != "" {
+		t.Errorf("reported twice: %q", m)
+	}
+	// Barely above the line is not recovered; clearly above is.
+	a.disk(5*gb+1, 100*gb, 5*gb, 0.10)
+	if m := a.disk(4*gb, 100*gb, 5*gb, 0.10); m != "" {
+		t.Errorf("flapping around the threshold reported again: %q", m)
+	}
+	a.disk(40*gb, 100*gb, 5*gb, 0.10)
+	if m := a.disk(2*gb, 100*gb, 5*gb, 0.10); m == "" {
+		t.Errorf("a new low-disk incident was not reported after recovery")
 	}
 }

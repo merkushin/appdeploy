@@ -21,6 +21,8 @@ const (
 	DeployRolledBack = "deploy.rolled_back"
 	MigrationSuspect = "migration.suspect"
 	BackupFailed     = "backup.failed"
+	AppCrashed       = "app.crashed"
+	DiskLow          = "disk.low"
 )
 
 // Event is the JSON body sent to generic webhooks.
@@ -51,6 +53,10 @@ func (e Event) Text() string {
 		return base + "deploy FAILED: " + e.Error
 	case DeployRolledBack:
 		return base + "ROLLED BACK automatically: " + e.Error
+	case AppCrashed:
+		return fmt.Sprintf("[appdeploy] %s: %s", e.App, e.Error)
+	case DiskLow:
+		return "[appdeploy] disk space is low: " + e.Error
 	case BackupFailed:
 		return fmt.Sprintf("[appdeploy] backup of %s FAILED: %s", e.App, e.Error)
 	case MigrationSuspect:
