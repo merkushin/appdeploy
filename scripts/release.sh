@@ -3,6 +3,8 @@
 #
 #   RELEASE_SIGNING_KEY=<base64 key> scripts/release.sh v1.2.3
 #
+# Also writes release-notes.md (or $NOTES_FILE) with the key fingerprint and how to verify the release.
+#
 # The public key is derived from the signing key. RELEASE_PUBLIC_KEY may be given
 # as a check: the script stops if it is not the public half of the signing key.
 #
@@ -45,4 +47,18 @@ done
 )
 RELEASE_SIGNING_KEY="$RELEASE_SIGNING_KEY" "$TOOL" sign -key-env RELEASE_SIGNING_KEY "$DIST/SHA256SUMS" > "$DIST/SHA256SUMS.sig"
 "$TOOL" verify -pub "$RELEASE_PUBLIC_KEY" "$DIST/SHA256SUMS" "$DIST/SHA256SUMS.sig"
-echo "release $VERSION is in $DIST/"
+# Notes that tell readers what to trust and how to check it; the workflow publishes them with the release.
+FINGERPRINT="$(RELEASE_SIGNING_KEY="$RELEASE_SIGNING_KEY" "$TOOL" fingerprint -key-env RELEASE_SIGNING_KEY)"
+cat > "${NOTES_FILE:-release-notes.md}" <<NOTES
+## Verify before you trust it
+
+Release key fingerprint (sha256): \`$FINGERPRINT\`
+Public key (ed25519, base64): \`$RELEASE_PUBLIC_KEY\`
+
+- Every binary has a build attestation: it proves the file was built by the release workflow of
+  \`$REPO\` and not elsewhere. With the GitHub CLI: \`gh attestation verify appdeploy-linux-amd64 --repo $REPO\`
+- Checksums: \`sha256sum --check --ignore-missing SHA256SUMS\`
+- After installing, \`appdeploy version --verbose\` shows the same key and fingerprint. Later updates
+  (\`appdeploy self-update\`) are accepted only when signed with that key.
+NOTES
+echo "release $VERSION is in $DIST/ (notes: ${NOTES_FILE:-release-notes.md})"

@@ -310,3 +310,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	res.Updated = true
 	return res, nil
 }
+
+// Fingerprint is the SHA-256 of the raw public key in hex: what you compare when
+// you check, out of band, that a binary trusts the key you expect. It can be
+// reproduced with: echo KEY | base64 -d | sha256sum
+func Fingerprint(pub ed25519.PublicKey) string {
+	h := sha256.Sum256(pub)
+	return hex.EncodeToString(h[:])
+}

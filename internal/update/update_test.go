@@ -281,3 +281,14 @@ func TestInstallsAnExactTagAndCallsBeforeSwap(t *testing.T) {
 		t.Errorf("the binary changed although BeforeSwap failed")
 	}
 }
+
+func TestFingerprintIsSHA256OfTheRawKey(t *testing.T) {
+	pub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	for i := range pub {
+		pub[i] = byte(i)
+	}
+	h := sha256.Sum256(pub)
+	if got := Fingerprint(pub); got != hex.EncodeToString(h[:]) || len(got) != 64 {
+		t.Errorf("Fingerprint = %q", got)
+	}
+}

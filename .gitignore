@@ -1,4 +1,5 @@
 # Release output and signing keys must never be committed.
 dist/
+release-notes.md
 release.key
 *.key

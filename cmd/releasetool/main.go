@@ -3,6 +3,7 @@
 //
 //	releasetool keygen -out release.key      writes the private key (0600), prints the public key
 //	releasetool pubkey -key release.key      prints the public key
+//	releasetool fingerprint -key release.key prints the SHA-256 fingerprint of the public key
 //	releasetool sign -key release.key FILE   prints the base64 signature of FILE
 //	releasetool sign -key-env VAR FILE       same, with the private key taken from $VAR
 //	releasetool verify -pub KEY FILE SIGFILE exits non-zero unless SIGFILE signs FILE for the public key
@@ -29,6 +30,8 @@ func main() {
 	switch os.Args[1] {
 	case "keygen":
 		err = keygen(os.Args[2:])
+	case "fingerprint":
+		err = fingerprint(os.Args[2:])
 	case "pubkey":
 		err = pubkey(os.Args[2:])
 	case "sign":
@@ -157,5 +160,20 @@ func verify(args []string) error {
 		return err
 	}
 	fmt.Println("signature is valid")
+	return nil
+}
+
+func fingerprint(args []string) error {
+	fs := flag.NewFlagSet("fingerprint", flag.ContinueOnError)
+	file := fs.String("key", "", "private key file")
+	env := fs.String("key-env", "", "environment variable holding the private key")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	k, err := loadKey(*file, *env)
+	if err != nil {
+		return err
+	}
+	fmt.Println(update.Fingerprint(k.Public().(ed25519.PublicKey)))
 	return nil
 }
