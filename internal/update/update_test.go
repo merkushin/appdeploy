@@ -57,7 +57,7 @@ func setup(t *testing.T, spec releaseSpec) *fixture {
 	f := &fixture{pub: pub}
 	mux := http.NewServeMux()
 	var base string
-	mux.HandleFunc("/repos/acme/tool/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	releaseJSON := func(w http.ResponseWriter, r *http.Request) {
 		assets := []map[string]string{
 			{"name": "SHA256SUMS", "url": base + "/api/1", "browser_download_url": base + "/dl/SHA256SUMS"},
 			{"name": "SHA256SUMS.sig", "url": base + "/api/2", "browser_download_url": base + "/dl/SHA256SUMS.sig"},
@@ -66,6 +66,14 @@ func setup(t *testing.T, spec releaseSpec) *fixture {
 			assets = append(assets, map[string]string{"name": "appdeploy-linux-amd64", "url": base + "/api/3", "browser_download_url": base + "/dl/appdeploy-linux-amd64"})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"tag_name": spec.tag, "assets": assets})
+	}
+	mux.HandleFunc("/repos/acme/tool/releases/latest", releaseJSON)
+	mux.HandleFunc("/repos/acme/tool/releases/tags/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimPrefix(r.URL.Path, "/repos/acme/tool/releases/tags/") != spec.tag {
+			http.NotFound(w, r)
+			return
+		}
+		releaseJSON(w, r)
 	})
 	body := map[string][]byte{"SHA256SUMS": sums, "SHA256SUMS.sig": sig, "appdeploy-linux-amd64": served}
 	for name, b := range body {
@@ -228,5 +236,48 @@ func TestParseVersionAndSums(t *testing.T) {
 	m := ParseSums([]byte("ABC123  appdeploy-linux-amd64\ndef456 *appdeploy-darwin-arm64\nnot a line\n"))
 	if m["appdeploy-linux-amd64"] != "abc123" || m["appdeploy-darwin-arm64"] != "def456" || len(m) != 2 {
 		t.Errorf("ParseSums = %v", m)
+	}
+}
+
+func TestInstallsAnExactTagAndCallsBeforeSwap(t *testing.T) {
+	f := setup(t, releaseSpec{tag: "v1.2.0"})
+	o := f.opts("1.0.0")
+	o.Tag = "v1.2.0"
+	var from, to string
+	o.BeforeSwap = func(a, b string) error {
+		from, to = a, b
+		if !strings.Contains(f.content(t), "appdeploy 1.0.0") {
+			t.Errorf("BeforeSwap ran after the binary was replaced")
+		}
+		return nil
+	}
+	if res, err := Run(context.Background(), o); err != nil || !res.Updated {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if from != "1.0.0" || to != "v1.2.0" {
+		t.Errorf("BeforeSwap(%q, %q)", from, to)
+	}
+
+	// A tag that is not the published one is not found; a malformed tag is refused early.
+	f = setup(t, releaseSpec{tag: "v1.2.0"})
+	o = f.opts("1.0.0")
+	o.Tag = "v1.9.9"
+	if _, err := Run(context.Background(), o); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Errorf("an unpublished tag: %v", err)
+	}
+	o.Tag = "latest"
+	if _, err := Run(context.Background(), o); err == nil || !strings.Contains(err.Error(), "not a version") {
+		t.Errorf("a malformed tag: %v", err)
+	}
+
+	// A failing BeforeSwap abandons the update and leaves the binary alone.
+	f = setup(t, releaseSpec{tag: "v1.2.0"})
+	o = f.opts("1.0.0")
+	o.BeforeSwap = func(string, string) error { return fmt.Errorf("disk full") }
+	if _, err := Run(context.Background(), o); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Errorf("BeforeSwap failure: %v", err)
+	}
+	if !strings.Contains(f.content(t), "appdeploy 1.0.0") {
+		t.Errorf("the binary changed although BeforeSwap failed")
 	}
 }

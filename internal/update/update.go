@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,11 +41,16 @@ type Options struct {
 	Current   string // version of the running binary; "dev" for unreleased builds
 	OS, Arch  string
 	Exe       string // path of the binary to replace
+	Tag       string // install exactly this release (e.g. v1.3.0) instead of the latest
 	Force     bool   // allow the same or an older version
 	CheckOnly bool   // report what would happen without changing anything
 	Token     string // optional GitHub token (private repositories)
 	Client    *http.Client
 	Log       func(format string, args ...any)
+	// BeforeSwap is called right before the new binary replaces the old one; if it
+	// fails the update is abandoned. The agent uses it to leave a marker that makes
+	// a failing new version revert (see Pending).
+	BeforeSwap func(from, to string) error
 }
 
 // Result reports what happened.
@@ -128,8 +134,8 @@ func VerifySums(pub ed25519.PublicKey, sums, sigB64 []byte) error {
 	return nil
 }
 
-func (o *Options) get(ctx context.Context, url string, limit int64, accept string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (o *Options) get(ctx context.Context, link string, limit int64, accept string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -150,14 +156,14 @@ func (o *Options) get(ctx context.Context, url string, limit int64, accept strin
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %s", redactURL(url), resp.Status)
+		return nil, fmt.Errorf("GET %s: %s", redactURL(link), resp.Status)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("%s is larger than %d bytes", redactURL(url), limit)
+		return nil, fmt.Errorf("%s is larger than %d bytes", redactURL(link), limit)
 	}
 	return b, nil
 }
@@ -169,7 +175,7 @@ func redactURL(u string) string {
 	return u
 }
 
-func (o *Options) assetURL(a asset) (url, accept string) {
+func (o *Options) assetURL(a asset) (link, accept string) {
 	if o.Token != "" && a.URL != "" {
 		return a.URL, "application/octet-stream" // private repositories serve assets through the API URL
 	}
@@ -188,8 +194,17 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if o.OS == "" || o.Arch == "" {
 		return res, errors.New("os and arch are required")
 	}
-	o.logf("looking for the latest release of %s", o.Repo)
-	b, err := o.get(ctx, strings.TrimRight(o.API, "/")+"/repos/"+o.Repo+"/releases/latest", maxText, "application/vnd.github+json")
+	path := "/releases/latest"
+	if o.Tag != "" {
+		if _, ok := ParseVersion(o.Tag); !ok {
+			return res, fmt.Errorf("%q is not a version like v1.2.3", o.Tag)
+		}
+		path = "/releases/tags/" + url.PathEscape(o.Tag)
+		o.logf("looking for release %s of %s", o.Tag, o.Repo)
+	} else {
+		o.logf("looking for the latest release of %s", o.Repo)
+	}
+	b, err := o.get(ctx, strings.TrimRight(o.API, "/")+"/repos/"+o.Repo+path, maxText, "application/vnd.github+json")
 	if err != nil {
 		return res, fmt.Errorf("finding the latest release: %w (has %s published a release?)", err, o.Repo)
 	}
@@ -229,13 +244,13 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		if err != nil {
 			return res, err
 		}
-		url, accept := o.assetURL(a)
+		assetLink, accept := o.assetURL(a)
 		limit := int64(maxText)
 		if i == 2 {
 			limit = maxBinary
 			o.logf("downloading %s", name)
 		}
-		if files[i], err = o.get(ctx, url, limit, accept); err != nil {
+		if files[i], err = o.get(ctx, assetLink, limit, accept); err != nil {
 			return res, err
 		}
 	}
@@ -276,6 +291,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	}
 	if !strings.Contains(out.String(), strings.TrimPrefix(rel.Tag, "v")) {
 		return res, fmt.Errorf("the downloaded binary reports %q, not %s", strings.TrimSpace(out.String()), rel.Tag)
+	}
+	if o.BeforeSwap != nil {
+		if err := o.BeforeSwap(o.Current, rel.Tag); err != nil {
+			return res, fmt.Errorf("preparing the update: %w", err)
+		}
 	}
 	prev := exe + ".previous"
 	_ = os.Remove(prev)
