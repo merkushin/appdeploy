@@ -139,6 +139,7 @@ type App struct {
 	ReleaseCommand string           `yaml:"release_command" json:"release_command,omitempty"`
 	Services       Services         `yaml:"services" json:"services"`
 	Watch          Watch            `yaml:"watch" json:"watch"`
+	AllowPartial   bool             `yaml:"allow_partial" json:"allow_partial,omitempty"`
 	KeepReleases   int              `yaml:"keep_releases" json:"keep_releases"`
 	Notify         []string         `yaml:"notify" json:"notify,omitempty"`
 }
