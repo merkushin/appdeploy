@@ -28,7 +28,7 @@ Client side (talks to the agent; --host runs it on a remote server over SSH):
   apps list
   apps destroy <app>
   status [<app>]
-  deploy <app> [--ref sha] [--detach]
+  deploy <app> [--ref sha | --image ref [--config appdeploy.yml]] [--detach]
   redeploy <app> [--detach]        redeploy the current image with current secrets
   rollback <app> [--to N] [--detach]
   releases <app>

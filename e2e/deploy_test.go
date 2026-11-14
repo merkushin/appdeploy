@@ -961,3 +961,56 @@ func TestSSHRoles(t *testing.T) {
 		t.Errorf("an unknown role: %v %s", err, out)
 	}
 }
+
+// An image built elsewhere (CI) deploys without a build, with the usual checks,
+// release numbers, updates and rollbacks.
+func TestDeployPrebuiltImage(t *testing.T) {
+	e := env
+	e.newApp(t, "ci", "ci.test")
+	src := e.newRepo(t, "hello")
+	build := func(msg string) string {
+		t.Helper()
+		src.write("message.txt", msg+"\n")
+		tag := e.instance + "-ci/hello:" + randHex(3)
+		if out, err := sh("docker", "build", "-q", "--label", "appdeploy.instance="+e.instance, "-t", tag, src.dir); err != nil {
+			t.Fatalf("building the CI image: %v\n%s", err, out)
+		}
+		return tag
+	}
+	cfgPath := filepath.Join(t.TempDir(), "appdeploy.yml")
+	if err := os.WriteFile(cfgPath, []byte("roles:\n  web:\n    memory: 96M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	v1 := build("ci one")
+	out := e.mustAd(t, "deploy", "ci", "--image", v1, "--config", cfgPath)
+	contains(t, out, "using image "+v1)
+	notContains(t, out, "==> building")
+	contains(t, out, "==> succeeded")
+	e.expectBody(t, "ci.test", "/", "ci one")
+
+	// A second image without --config keeps the live release's config.
+	v2 := build("ci two")
+	out = e.mustAd(t, "deploy", "ci", "--image", v2)
+	contains(t, out, "==> succeeded")
+	e.expectBody(t, "ci.test", "/", "ci two")
+	s := e.status(t, "ci")
+	if s.App.CurrentRelease != 2 || len(s.Releases) != 2 {
+		t.Errorf("releases: current=v%d count=%d", s.App.CurrentRelease, len(s.Releases))
+	}
+	e.mustAd(t, "rollback", "ci")
+	e.expectBody(t, "ci.test", "/", "ci one")
+
+	// Bad references and unreachable registries fail clearly and leave things as they are.
+	if out, err := e.ad("deploy", "ci", "--image", "-x=oops"); err == nil || !strings.Contains(out, "invalid image reference") {
+		t.Errorf("a bad reference: %v %s", err, out)
+	}
+	out, err := e.ad("deploy", "ci", "--image", "registry.invalid/nothing/here:1")
+	if err == nil || !strings.Contains(out, "pulling registry.invalid/nothing/here:1") {
+		t.Errorf("an unreachable registry: %v %s", err, out)
+	}
+	e.expectBody(t, "ci.test", "/", "ci one")
+	if out, err := e.ad("deploy", "ci", "--image", v2, "--config", cfgPath+".missing"); err == nil {
+		t.Errorf("a missing config file was accepted: %s", out)
+	}
+}

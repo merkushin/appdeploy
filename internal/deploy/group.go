@@ -34,6 +34,7 @@ type PeerPayload struct {
 	Config      json.RawMessage   `json:"config,omitempty"`
 	Env         map[string]string `json:"env,omitempty"` // the release's environment snapshot
 	WatchWindow config.Duration   `json:"watch_window,omitempty"`
+	ConfigYAML  string            `json:"config_yaml,omitempty"`  // Source "image": appdeploy.yml contents
 	RemoveImage bool              `json:"remove_image,omitempty"` // dropbuild: also delete the built image
 }
 

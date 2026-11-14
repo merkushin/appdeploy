@@ -168,6 +168,18 @@ func (c *Client) ImageExposedPort(ctx context.Context, image string) (int, error
 	return best, nil
 }
 
+// Pull downloads an image, streaming progress lines to out.
+func (c *Client) Pull(ctx context.Context, ref string, out io.Writer) error {
+	cmd := exec.CommandContext(ctx, c.bin(), "pull", "--quiet", ref)
+	var tail tailBuffer
+	w := io.MultiWriter(out, &tail)
+	cmd.Stdout, cmd.Stderr = w, w
+	if err := cmd.Run(); err != nil {
+		return &Error{Args: []string{"pull", ref}, Stderr: tail.String(), Err: err}
+	}
+	return nil
+}
+
 // Tag adds a new name to an existing image.
 func (c *Client) Tag(ctx context.Context, src, dst string) error {
 	_, err := c.run(ctx, "tag", src, dst)

@@ -267,13 +267,15 @@ func (s *Server) submit(w http.ResponseWriter, req deploy.Request) {
 
 func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Ref string `json:"ref"`
+		Ref        string `json:"ref"`
+		Image      string `json:"image"`
+		ConfigYAML string `json:"config_yaml"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.submit(w, deploy.Request{App: r.PathValue("app"), Ref: req.Ref, Source: "cli"})
+	s.submit(w, deploy.Request{App: r.PathValue("app"), Ref: req.Ref, Source: "cli", Image: req.Image, ConfigYAML: req.ConfigYAML})
 }
 
 func (s *Server) redeploy(w http.ResponseWriter, r *http.Request) {

@@ -9,10 +9,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -348,7 +350,12 @@ type Request struct {
 	Ref        string // git ref or sha; empty = head of the app's deploy branch
 	Source     string // push | cli | redeploy (current image with current secrets)
 	RollbackTo int    // > 0: re-activate that release
+
+	Image      string // Source "image": a prebuilt image to deploy instead of building
+	ConfigYAML string // Source "image": the contents of an appdeploy.yml to use
 }
+
+var imageRefRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
 
 // Submit queues a deploy and returns immediately. Deploys of one app run one
 // at a time; a deploy still waiting when a newer one arrives is superseded.
@@ -377,6 +384,17 @@ func (e *Engine) Submit(req Request) (store.Deploy, error) {
 			return d, fmt.Errorf("app %q has nothing deployed yet", app.Name)
 		}
 		d.Release, _ = e.st.NextReleaseNumber(app.Name)
+	case req.Image != "":
+		if !imageRefRe.MatchString(req.Image) {
+			return d, fmt.Errorf("invalid image reference %q", req.Image)
+		}
+		if req.ConfigYAML != "" {
+			if _, err := config.Parse([]byte(req.ConfigYAML)); err != nil {
+				return d, err
+			}
+		}
+		d.Source, d.Ref = "image", req.Image
+		d.Release, _ = e.st.NextReleaseNumber(app.Name)
 	default:
 		if d.Source == "" {
 			d.Source = "cli"
@@ -385,6 +403,12 @@ func (e *Engine) Submit(req Request) (store.Deploy, error) {
 	}
 	if err := e.st.CreateDeploy(d); err != nil {
 		return d, err
+	}
+	if d.Source == "image" {
+		b, _ := json.Marshal(PeerPayload{ConfigYAML: req.ConfigYAML})
+		if err := e.st.PutPayload(d.ID, b); err != nil {
+			return d, err
+		}
 	}
 	e.enqueueLocked(d, "queued ("+d.Source+")")
 	return d, nil

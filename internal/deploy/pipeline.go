@@ -125,6 +125,13 @@ func (r *run) pipeline() error {
 		if e.groupMode() && d.Ref != RefPeer {
 			return r.groupRollback()
 		}
+	case "image":
+		if err := r.loadImage(); err != nil {
+			return err
+		}
+		if err := r.snapshot(); err != nil {
+			return err
+		}
 	case "peer":
 		if app.CurrentRelease == d.Release {
 			// A repeated request (the coordinator restarted and asked again):
@@ -175,7 +182,11 @@ func (r *run) pipeline() error {
 	if err := r.checkResources(); err != nil {
 		return err
 	}
-	if d.Source != "rollback" && d.Source != "redeploy" && d.Source != "peer" {
+	if d.Source == "image" {
+		if err := r.migrate(); err != nil {
+			return err
+		}
+	} else if d.Source != "rollback" && d.Source != "redeploy" && d.Source != "peer" {
 		if b, ok := e.builder(); ok && e.groupMode() {
 			err = r.buildRemote(b)
 		} else {
@@ -299,7 +310,7 @@ func (r *run) checkResources() error {
 	}
 	r.logf("memory: %s reserved + %s for this release of %s available", human(used), human(need), human(total-reserve))
 
-	if r.d.Source != "rollback" && r.d.Source != "redeploy" && r.d.Source != "peer" {
+	if r.d.Source != "rollback" && r.d.Source != "redeploy" && r.d.Source != "peer" && r.d.Source != "image" {
 		var st syscall.Statfs_t
 		if err := syscall.Statfs(e.opt.DataDir, &st); err == nil {
 			free := int64(st.Bavail) * int64(st.Bsize)
@@ -909,4 +920,50 @@ func (r *run) snapshot() error {
 		}
 	}
 	return e.snapshotSecrets(r.d.App, r.d.Release, extra)
+}
+
+// loadImage prepares a deploy of a prebuilt image: its config comes from the
+// --config the client sent, else from the live release, else the defaults, and
+// the image is used from this server's Docker or pulled.
+func (r *run) loadImage() error {
+	e := r.e
+	p, err := r.payload()
+	if err != nil {
+		return err
+	}
+	switch {
+	case p.ConfigYAML != "":
+		r.cfg, err = config.ParseWith([]byte(p.ConfigYAML), config.Defaults{WatchWindow: e.opt.DefaultWatchWindow})
+	case r.app.CurrentRelease > 0:
+		var rel store.Release
+		if rel, err = e.st.GetRelease(r.d.App, r.app.CurrentRelease); err == nil {
+			r.cfg, err = config.FromJSON(rel.Config)
+		}
+	default:
+		r.cfg, err = config.ParseWith(nil, config.Defaults{WatchWindow: e.opt.DefaultWatchWindow})
+	}
+	if err != nil {
+		return err
+	}
+	ref := r.d.Ref
+	if e.dk.ImageExists(e.ctx, ref) {
+		r.logf("using image %s from this server", ref)
+	} else {
+		r.logf("pulling %s", ref)
+		lw := docker.NewLineWriter(func(s string) { r.logf("  %s", s) })
+		err := e.dk.Pull(e.ctx, ref, lw)
+		lw.Flush()
+		if err != nil {
+			if e.ctx.Err() != nil {
+				return e.ctx.Err()
+			}
+			return fmt.Errorf("pulling %s: %w (private registries need docker login on the server)", ref, err)
+		}
+	}
+	tag := e.imageTag(r.d.App, r.d.Release)
+	if err := e.dk.Tag(e.ctx, ref, tag); err != nil {
+		return err
+	}
+	r.image, r.builtImage, r.sha = tag, true, ref
+	return nil
 }

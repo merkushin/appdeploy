@@ -239,6 +239,8 @@ func cmdDeploy(ctx context.Context, c *api.Client, kind string, args []string) (
 	fs := flag.NewFlagSet(kind, flag.ContinueOnError)
 	ref := fs.String("ref", "", "git ref or commit (deploy only)")
 	to := fs.Int("to", 0, "release number (rollback only; default: the previous one)")
+	image := fs.String("image", "", "deploy this prebuilt image instead of building (deploy only)")
+	cfgFile := fs.String("config", "", "appdeploy.yml to use with --image (default: the live release's config)")
 	detach := fs.Bool("detach", false, "do not wait for the deploy to finish")
 	pos, err := parseFlags(fs, args)
 	if err != nil || len(pos) != 1 {
@@ -247,7 +249,19 @@ func cmdDeploy(ctx context.Context, c *api.Client, kind string, args []string) (
 	var resp api.DeployResponse
 	switch kind {
 	case "deploy":
-		resp, err = c.Deploy(ctx, pos[0], *ref)
+		if *image != "" {
+			yaml := ""
+			if *cfgFile != "" {
+				b, rerr := os.ReadFile(*cfgFile)
+				if rerr != nil {
+					return 1, rerr
+				}
+				yaml = string(b)
+			}
+			resp, err = c.DeployImage(ctx, pos[0], *image, yaml)
+		} else {
+			resp, err = c.Deploy(ctx, pos[0], *ref)
+		}
 	case "redeploy":
 		resp, err = c.Redeploy(ctx, pos[0])
 	case "rollback":

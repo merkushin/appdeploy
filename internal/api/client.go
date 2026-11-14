@@ -127,6 +127,13 @@ func (c *Client) Deploy(ctx context.Context, app, ref string) (DeployResponse, e
 	return out, err
 }
 
+// DeployImage deploys a prebuilt image; configYAML (may be empty) is the content of an appdeploy.yml.
+func (c *Client) DeployImage(ctx context.Context, app, image, configYAML string) (DeployResponse, error) {
+	var out DeployResponse
+	err := c.call(ctx, "POST", "/v1/apps/"+app+"/deploy", map[string]any{"image": image, "config_yaml": configYAML}, &out)
+	return out, err
+}
+
 func (c *Client) Redeploy(ctx context.Context, app string) (DeployResponse, error) {
 	var out DeployResponse
 	err := c.call(ctx, "POST", "/v1/apps/"+app+"/redeploy", nil, &out)
