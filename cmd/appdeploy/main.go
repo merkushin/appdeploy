@@ -30,11 +30,16 @@ Server side:
   appdeploy agent [flags]          run the agent (normally under systemd)
 
 Client side (talks to the agent; --host runs it on a remote server over SSH):
-  appdeploy [--host user@host] [--socket path] [--json] <command>
+  appdeploy [--host user@host|name] [--socket path] [--json] <command>
+
+  Where a command runs, first match wins: --host; $APPDEPLOY_HOST; host: or hosts: in
+  appdeploy.yml of the current directory; the git remote "appdeploy" or "prod"; the default of
+  "appdeploy hosts"; else the local agent.
 
   --json prints JSON instead of text: lists and objects as one line, deploys as one JSON
       line per journal entry ending with {"done":true,...}, errors as {"error":"..."}.
 
+  hosts [list|add|remove]          the servers saved on this machine (~/.config/appdeploy/hosts.yml)
   ping                             check that the agent answers (no output, exit status 0)
   check [file] [--json]            validate an appdeploy.yml on this machine, without a server
   import kamal [deploy.yml] [--secrets file] [--out file] [--force]   turn a Kamal setup into appdeploy.yml and commands (on this machine)
@@ -81,6 +86,8 @@ func main() {
 		os.Exit(runCheck(args[1:]))
 	case "import":
 		os.Exit(runImport(args[1:]))
+	case "hosts":
+		os.Exit(runHosts(args[1:]))
 	case "recover":
 		os.Exit(runRecover(args[1:]))
 	case "version", "--version":

@@ -66,8 +66,16 @@ func runClient(args []string) int {
 		fmt.Fprint(os.Stderr, usage)
 		return 2
 	}
-	if host == "" {
-		host = os.Getenv("APPDEPLOY_HOST")
+	if args[0] != "ping" || host != "" {
+		wd, _ := os.Getwd()
+		h, source, err := resolveHost(host, wd)
+		if err != nil {
+			return die("%v", err)
+		}
+		if source != "" && !jsonOut {
+			fmt.Fprintf(os.Stderr, "appdeploy: using the server %s (from %s)\n", h, source)
+		}
+		host = h
 	}
 	if host != "" {
 		if jsonOut {

@@ -152,6 +152,8 @@ type App struct {
 	AllowPartial   bool              `yaml:"allow_partial" json:"allow_partial,omitempty"`
 	KeepReleases   int               `yaml:"keep_releases" json:"keep_releases"`
 	Notify         []string          `yaml:"notify" json:"notify,omitempty"`
+	Host           string            `yaml:"host" json:"host,omitempty"`   // used by the client only: where to run commands
+	Hosts          map[string]string `yaml:"hosts" json:"hosts,omitempty"` // named servers for --host NAME
 }
 
 // Default returns the configuration of a repository that has no appdeploy.yml.
@@ -282,6 +284,17 @@ func (a *App) Validate() error {
 	if a.KeepReleases < 1 {
 		return errors.New("keep_releases must be at least 1")
 	}
+	if a.Host != "" && !ValidHost(a.Host) {
+		return fmt.Errorf("host: %q is not a user@host or host address", a.Host)
+	}
+	for name, h := range a.Hosts {
+		if !ValidAppName(name) {
+			return fmt.Errorf("hosts: the name %q must be lowercase letters, digits and dashes, starting with a letter", name)
+		}
+		if !ValidHost(h) {
+			return fmt.Errorf("hosts.%s: %q is not a user@host or host address", name, h)
+		}
+	}
 	if len(a.Roles) == 0 {
 		return errors.New("roles: at least one role is required")
 	}
@@ -400,3 +413,9 @@ func (a *App) Warnings() []string {
 	}
 	return w
 }
+
+var hostRe = regexp.MustCompile(`^([A-Za-z0-9._-]+@)?[A-Za-z0-9._:\[\]-]+$`)
+
+// ValidHost reports whether s can be given to ssh as a destination: no spaces, and
+// no leading dash, which ssh would read as an option.
+func ValidHost(s string) bool { return !strings.HasPrefix(s, "-") && hostRe.MatchString(s) }

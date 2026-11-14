@@ -183,3 +183,14 @@ func TestWarnings(t *testing.T) {
 		}
 	}
 }
+
+func TestHostsAreValidated(t *testing.T) {
+	if _, err := Parse([]byte("host: deploy@box.example.com\nhosts:\n  staging: deploy@10.0.0.2\n")); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"host: \"-oProxyCommand=x\"", "host: \"a b\"", "hosts:\n  Prod: x@y", "hosts:\n  prod: \"-x\""} {
+		if _, err := Parse([]byte(bad)); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
