@@ -90,7 +90,8 @@ appdeploy hosts add my-server deploy@my-server    # saved on this computer; the 
 appdeploy ping                                      # now without --host
 ```
 
-The rest of this guide keeps `--host` in the examples so that each command stands alone.
+The rest of this guide assumes you saved the server with `appdeploy hosts add`; without that, put
+`--host deploy@my-server` after `appdeploy` in each command.
 
 ## 3. What your app must provide
 
@@ -113,7 +114,7 @@ for the ones that are not secret). A minimal example is in
 ## 4. Create the app and deploy
 
 ```bash
-appdeploy --host deploy@my-server apps create myapp --domain myapp.example.com
+appdeploy apps create myapp --domain myapp.example.com
 ```
 ```
 created app myapp (deploy branch main)
@@ -155,7 +156,7 @@ scripts and CI use `appdeploy deploy` (below), which exits non-zero on failure.
 Watch the state at any time:
 
 ```bash
-appdeploy --host deploy@my-server status myapp
+appdeploy status myapp
 ```
 ```
 myapp  release v1  domains: myapp.example.com
@@ -189,7 +190,7 @@ services:
 Secrets and environment variables are set from the command line and stored on the server:
 
 ```bash
-appdeploy --host deploy@my-server secrets set myapp SESSION_SECRET=... STRIPE_KEY=...
+appdeploy secrets set myapp SESSION_SECRET=... STRIPE_KEY=...
 ```
 
 This makes a new release (without rebuilding) so the running app picks them up; add
@@ -199,10 +200,10 @@ This makes a new release (without rebuilding) so the running app picks them up; 
 
 ```bash
 git push prod main                                   # deploy
-appdeploy --host deploy@my-server logs myapp -f      # follow logs
-appdeploy --host deploy@my-server releases myapp     # list releases
-appdeploy --host deploy@my-server rollback myapp     # back to the previous release
-appdeploy --host deploy@my-server exec myapp -- <command>   # run a command in the running container (no terminal)
+appdeploy logs myapp -f      # follow logs
+appdeploy releases myapp     # list releases
+appdeploy rollback myapp     # back to the previous release
+appdeploy exec myapp -- <command>   # run a command in the running container (no terminal)
 ```
 
 For deploying from CI, see [Operations: deploying from CI](operations.md#deploying-from-ci).
