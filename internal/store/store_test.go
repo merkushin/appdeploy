@@ -105,3 +105,23 @@ func TestContainersAndDelete(t *testing.T) {
 		t.Fatalf("second delete: %v", err)
 	}
 }
+
+func TestFinalsKeepTheNewest(t *testing.T) {
+	s := open(t)
+	if ok, _ := s.PutFinal(Final{App: "a", Release: 2, TS: 100}); !ok {
+		t.Fatal("first record not stored")
+	}
+	if ok, _ := s.PutFinal(Final{App: "a", Release: 1, TS: 50}); ok {
+		t.Errorf("an older record replaced a newer one")
+	}
+	if ok, _ := s.PutFinal(Final{App: "a", Release: 2, TS: 100}); ok {
+		t.Errorf("an identical record counted as news")
+	}
+	if ok, _ := s.PutFinal(Final{App: "a", Release: 1, TS: 200}); !ok {
+		t.Errorf("a newer record (a rollback to v1) was refused")
+	}
+	fs, _ := s.ListFinals()
+	if len(fs) != 1 || fs[0].Release != 1 || fs[0].TS != 200 {
+		t.Errorf("finals: %+v", fs)
+	}
+}

@@ -125,6 +125,11 @@ CREATE TABLE IF NOT EXISTS deploys (
   finished_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS deploys_app ON deploys(app, started_at);
+CREATE TABLE IF NOT EXISTS finals (
+  app TEXT PRIMARY KEY,
+  release INTEGER NOT NULL,
+  ts INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS payloads (
   deploy_id TEXT PRIMARY KEY,
   data TEXT NOT NULL
@@ -523,4 +528,51 @@ func (s *Store) GetPayload(deployID string) ([]byte, error) {
 		return nil, ErrNotFound
 	}
 	return []byte(d), err
+}
+
+// ---- finals: the release a completed rollout left every server on ----
+
+// Final records that a rollout (or rollback) of app to release completed at ts
+// (unix milliseconds). Servers exchange these so that one that missed the
+// rollout can catch up.
+type Final struct {
+	App     string `json:"app"`
+	Release int    `json:"release"`
+	TS      int64  `json:"ts"`
+}
+
+// PutFinal stores f unless a newer record exists. It reports whether f was stored.
+func (s *Store) PutFinal(f Final) (bool, error) {
+	res, err := s.db.Exec(`INSERT INTO finals(app, release, ts) VALUES(?,?,?)
+	  ON CONFLICT(app) DO UPDATE SET release=excluded.release, ts=excluded.ts WHERE excluded.ts > finals.ts`,
+		f.App, f.Release, f.TS)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) ListFinals() ([]Final, error) {
+	rows, err := s.db.Query(`SELECT app, release, ts FROM finals ORDER BY app`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Final
+	for rows.Next() {
+		var f Final
+		if err := rows.Scan(&f.App, &f.Release, &f.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// LastSucceeded returns when the app's most recent successful deploy finished (zero if none).
+func (s *Store) LastSucceeded(app string) (time.Time, error) {
+	var ms int64
+	err := s.db.QueryRow(`SELECT COALESCE(MAX(finished_at),0) FROM deploys WHERE app=? AND state='succeeded'`, app).Scan(&ms)
+	return fromTS(ms), err
 }
