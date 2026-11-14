@@ -43,6 +43,8 @@ func (p *PeerServer) Handler() http.Handler {
 	}))
 	mux.HandleFunc("PUT /peer/v1/group", p.auth(p.putGroup))
 	mux.HandleFunc("POST /peer/v1/image", p.auth(p.image))
+	mux.HandleFunc("GET /peer/v1/image", p.auth(p.fetchImage))
+	mux.HandleFunc("POST /peer/v1/source", p.auth(p.source))
 	mux.HandleFunc("POST /peer/v1/deploy", p.auth(p.deploy))
 	mux.HandleFunc("GET /peer/v1/deploys/{id}/events", p.auth(p.Ctl.events))
 	return mux
@@ -112,6 +114,42 @@ func (p *PeerServer) image(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// source receives the build context of a release this server is to build.
+func (p *PeerServer) source(w http.ResponseWriter, r *http.Request) {
+	app := r.URL.Query().Get("app")
+	rel, _ := strconv.Atoi(r.URL.Query().Get("release"))
+	if !config.ValidAppName(app) || rel < 1 {
+		writeErr(w, errors.New("bad app or release"))
+		return
+	}
+	if err := p.Ctl.Eng.ReceiveSource(app, rel, r.Body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// fetchImage streams a release image as a gzip-compressed `docker save`.
+func (p *PeerServer) fetchImage(w http.ResponseWriter, r *http.Request) {
+	app := r.URL.Query().Get("app")
+	rel, _ := strconv.Atoi(r.URL.Query().Get("release"))
+	if !config.ValidAppName(app) || rel < 1 {
+		writeErr(w, errors.New("bad app or release"))
+		return
+	}
+	tag := p.Ctl.Eng.ImageTag(app, rel)
+	if !p.Ctl.Dk.ImageExists(r.Context(), tag) {
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "no image " + tag})
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	zw := gzip.NewWriter(w)
+	if err := p.Ctl.Dk.Save(r.Context(), tag, zw); err != nil {
+		return // the stream is already under way; the receiver sees it end early
+	}
+	_ = zw.Close()
+}
+
 func (p *PeerServer) deploy(w http.ResponseWriter, r *http.Request) {
 	var pl deploy.PeerPayload
 	if err := decode(r, &pl); err != nil {
@@ -154,6 +192,39 @@ func (c *PeerClient) SendImage(ctx context.Context, srv group.Server, app string
 		return readError(resp)
 	}
 	return nil
+}
+
+func (c *PeerClient) SendSource(ctx context.Context, srv group.Server, app string, release int, body io.Reader) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(srv, fmt.Sprintf("/peer/v1/source?app=%s&release=%d", app, release)), body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/gzip")
+	resp, err := c.Group.Client(0).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return readError(resp)
+	}
+	return nil
+}
+
+func (c *PeerClient) FetchImage(ctx context.Context, srv group.Server, app string, release int) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, fmt.Sprintf("/peer/v1/image?app=%s&release=%d", app, release)), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.Group.Client(0).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode/100 != 2 {
+		defer resp.Body.Close()
+		return nil, readError(resp)
+	}
+	return resp.Body, nil
 }
 
 func (c *PeerClient) StartDeploy(ctx context.Context, srv group.Server, p deploy.PeerPayload) (string, error) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ type PeerPayload struct {
 	Config      json.RawMessage   `json:"config,omitempty"`
 	Env         map[string]string `json:"env,omitempty"` // the release's environment snapshot
 	WatchWindow config.Duration   `json:"watch_window,omitempty"`
+	RemoveImage bool              `json:"remove_image,omitempty"` // dropbuild: also delete the built image
 }
 
 // Remote reaches the other servers of the group. The api package implements it
@@ -40,6 +42,10 @@ type PeerPayload struct {
 type Remote interface {
 	// SendImage streams a gzip-compressed `docker save` of the release image.
 	SendImage(ctx context.Context, srv group.Server, app string, release int, body io.Reader) error
+	// SendSource streams a gzip-compressed tar of the build context to a build server.
+	SendSource(ctx context.Context, srv group.Server, app string, release int, body io.Reader) error
+	// FetchImage streams the built release image (gzip-compressed `docker save`) from a build server.
+	FetchImage(ctx context.Context, srv group.Server, app string, release int) (io.ReadCloser, error)
 	// StartDeploy asks the server to run the payload and returns its local deploy id.
 	StartDeploy(ctx context.Context, srv group.Server, p PeerPayload) (string, error)
 	// StreamDeploy follows that deploy's journal and returns its final state.
@@ -96,7 +102,7 @@ func (e *Engine) SubmitPeer(p PeerPayload) (store.Deploy, error) {
 	}
 	app, err := e.st.GetApp(p.App)
 	if errors.Is(err, store.ErrNotFound) {
-		if p.Kind != "deploy" {
+		if p.Kind != "deploy" && p.Kind != "build" {
 			return e.doneDeploy(p, "app is not known here: nothing to do")
 		}
 		if err = e.st.CreateApp(store.App{Name: p.App, Domains: p.Domains, Branch: p.Branch}); err != nil && !errors.Is(err, store.ErrExists) {
@@ -125,6 +131,15 @@ func (e *Engine) SubmitPeer(p PeerPayload) (store.Deploy, error) {
 		if d.Ref == "" {
 			d.Ref = RefPeer
 		}
+	case "build":
+		d.Source = "build"
+	case "dropbuild":
+		// Clean up after a build for another server; never touch a live release.
+		_ = os.RemoveAll(e.srcDir(p.App, p.Release))
+		if p.RemoveImage && app.CurrentRelease != p.Release {
+			_ = e.dk.RemoveImage(e.ctx, e.imageTag(p.App, p.Release))
+		}
+		return e.doneDeployLocked(p, "build leftovers removed")
 	case "rollback":
 		if app.CurrentRelease == p.Release {
 			return e.doneDeployLocked(p, fmt.Sprintf("already serving v%d", p.Release))
@@ -188,14 +203,46 @@ func (e *Engine) doneDeployLocked(p PeerPayload, msg string) (store.Deploy, erro
 }
 
 // loadPeer prepares a "peer" deploy from the stored payload.
+func (r *run) payload() (PeerPayload, error) {
+	var p PeerPayload
+	raw, err := r.e.st.GetPayload(r.d.ID)
+	if err != nil {
+		return p, fmt.Errorf("payload of the deploy is missing: %w", err)
+	}
+	return p, json.Unmarshal(raw, &p)
+}
+
+// buildForPeer builds the image of a release for the coordinator that sent its
+// source here; the coordinator fetches the image afterwards.
+func (r *run) buildForPeer() error {
+	e := r.e
+	r.state(store.StateValidating)
+	p, err := r.payload()
+	if err != nil {
+		return err
+	}
+	if r.cfg, err = config.FromJSON(p.Config); err != nil {
+		return err
+	}
+	r.sha = p.Commit
+	r.buildDir = e.srcDir(r.d.App, r.d.Release)
+	if _, err := os.Stat(r.buildDir); err != nil {
+		return fmt.Errorf("the source of v%d was not delivered to this server", r.d.Release)
+	}
+	if err := r.checkResources(); err != nil {
+		return err
+	}
+	if err := r.build(); err != nil {
+		return err
+	}
+	r.state(store.StateSucceeded)
+	return nil
+}
+
 func (r *run) loadPeer() error {
 	e := r.e
-	raw, err := e.st.GetPayload(r.d.ID)
+	p, err := r.payload()
 	if err != nil {
-		return fmt.Errorf("payload of the deploy is missing: %w", err)
-	}
-	var p PeerPayload
-	if err := json.Unmarshal(raw, &p); err != nil {
 		return err
 	}
 	cfg, err := config.FromJSON(p.Config)
@@ -309,8 +356,8 @@ func (r *run) rollout() error {
 	var wg sync.WaitGroup
 	errs := make(chan error, len(targets))
 	for _, t := range targets {
-		if t.Name == g.Self {
-			continue
+		if t.Name == g.Self || (r.builderSrv != nil && t.Name == r.builderSrv.Name) {
+			continue // this server has the image; so does the one that built it
 		}
 		t := t
 		wg.Add(1)
@@ -407,6 +454,7 @@ func (r *run) rollout() error {
 	_ = e.st.SetDeployState(r.d.ID, store.StateSucceeded, "")
 	r.d.State = store.StateSucceeded
 	r.logf("==> succeeded: %s is now serving v%d on %s", r.d.App, r.d.Release, strings.Join(names, ", "))
+	r.dropRemoteBuild()
 	r.emit(notify.DeploySucceeded, "")
 	return nil
 }
@@ -505,4 +553,74 @@ func (r *run) groupRollback() error {
 	r.d.State = store.StateSucceeded
 	r.logf("==> succeeded: %s is serving v%d on every server", r.d.App, r.d.Release)
 	return nil
+}
+
+// builder returns the server that builds images for the group, if there is one
+// other than this server: the first (by name) carrying the label "builder". A
+// server that is itself a builder builds locally.
+func (e *Engine) builder() (group.Server, bool) {
+	g := e.opt.Group
+	if g == nil || g.Me().HasLabel("builder") {
+		return group.Server{}, false
+	}
+	for _, s := range g.Peers() {
+		if s.HasLabel("builder") {
+			return s, true
+		}
+	}
+	return group.Server{}, false
+}
+
+// buildRemote has the build server build the release and brings the image back.
+func (r *run) buildRemote(b group.Server) error {
+	e := r.e
+	ctx := e.ctx
+	r.state(store.StateBuilding)
+	r.logf("building on %s", b.Name)
+	pr, pw := io.Pipe()
+	go func() { pw.CloseWithError(tarDir(pw, r.buildDir)) }()
+	if err := e.opt.Remote.SendSource(ctx, b, r.d.App, r.d.Release, pr); err != nil {
+		pr.CloseWithError(err)
+		return fmt.Errorf("sending the source to %s: %w", b.Name, err)
+	}
+	r.builderSrv = &b
+	if err := r.runOn(b, PeerPayload{Kind: "build", App: r.d.App, Release: r.d.Release, Commit: r.sha, Config: r.cfg.JSON()}); err != nil {
+		return fmt.Errorf("build failed: %w", err)
+	}
+	body, err := e.opt.Remote.FetchImage(ctx, b, r.d.App, r.d.Release)
+	if err != nil {
+		return fmt.Errorf("fetching the image from %s: %w", b.Name, err)
+	}
+	defer body.Close()
+	zr, err := gzip.NewReader(body)
+	if err != nil {
+		return err
+	}
+	loaded, err := e.dk.Load(ctx, zr)
+	if err != nil {
+		return fmt.Errorf("loading the image from %s: %w", b.Name, err)
+	}
+	want := e.imageTag(r.d.App, r.d.Release)
+	if loaded != want {
+		if err := e.dk.Tag(ctx, loaded, want); err != nil {
+			return err
+		}
+	}
+	r.image, r.builtImage = want, true
+	_ = os.RemoveAll(r.buildDir)
+	return nil
+}
+
+// dropRemoteBuild tells the build server to forget the release's source and image
+// (it keeps the image if that release is live there).
+func (r *run) dropRemoteBuild() {
+	if r.builderSrv == nil || r.e.ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p := PeerPayload{Kind: "dropbuild", App: r.d.App, Release: r.d.Release, RemoveImage: true}
+	if id, err := r.e.opt.Remote.StartDeploy(ctx, *r.builderSrv, p); err == nil {
+		_, _, _ = r.e.opt.Remote.StreamDeploy(ctx, *r.builderSrv, id, func(string) {})
+	}
 }

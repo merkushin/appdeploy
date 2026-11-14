@@ -15,6 +15,7 @@ import (
 
 	"appdeploy/internal/config"
 	"appdeploy/internal/docker"
+	"appdeploy/internal/group"
 	"appdeploy/internal/notify"
 	"appdeploy/internal/store"
 )
@@ -31,6 +32,8 @@ type run struct {
 	sha        string
 	buildDir   string
 	builtImage bool // this run created the image tag
+
+	builderSrv *group.Server // the build server used for this deploy, if any
 
 	migAt   time.Time // when the release command finished; zero if there was none
 	migBase float64   // previous release's 5xx rate before the release command
@@ -54,6 +57,7 @@ func (r *run) state(s string) {
 // and records the failure.
 func (r *run) fail(err error) {
 	r.logf("deploy failed: %v", err)
+	r.dropRemoteBuild()
 	r.cleanup()
 	_ = r.e.st.SetDeployState(r.d.ID, store.StateFailed, err.Error())
 	r.d.State = store.StateFailed
@@ -105,6 +109,8 @@ func (r *run) pipeline() error {
 	r.prev = app.CurrentRelease
 
 	switch d.Source {
+	case "build":
+		return r.buildForPeer()
 	case "rollback":
 		if err := r.loadRelease(d.Release); err != nil {
 			return err
@@ -170,7 +176,12 @@ func (r *run) pipeline() error {
 		return err
 	}
 	if d.Source != "rollback" && d.Source != "redeploy" && d.Source != "peer" {
-		if err := r.build(); err != nil {
+		if b, ok := e.builder(); ok && e.groupMode() {
+			err = r.buildRemote(b)
+		} else {
+			err = r.build()
+		}
+		if err != nil {
 			return err
 		}
 		if err := r.migrate(); err != nil {
