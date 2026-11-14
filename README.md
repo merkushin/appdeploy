@@ -1,76 +1,99 @@
 # appdeploy
 
-Deploy web apps to your own servers with `git push`. A small agent on each server builds,
-starts, health-checks, switches traffic and cleans up, and it finishes the job even if your
-laptop disconnects or the agent itself restarts. See [SPEC.md](SPEC.md) for the design.
-
-Status: usable on one server or a small group. After a deploy the new release is watched
-against real traffic and rolled back automatically if it misbehaves; deploy events go to
-webhooks; `services: {postgres: true}` gives an app its own database with daily backups;
-several servers work as a group with mutual TLS: one push builds once and rolls out to the
-servers whose labels match, canary first. A server labeled `builder` builds for the group, a
-server that was down catches up by itself when it is back (SPEC.md §21, §23-§25).
-
-## Quick start
-
-On a Debian/Ubuntu server with systemd (as root; untested on real hardware so far, see
-SPEC.md §23):
+Deploy web apps to your own servers with `git push`. A small agent on each server builds your
+Dockerfile, starts the new version next to the old one, checks it, switches traffic, watches
+the real traffic for a few minutes, and **rolls back by itself** if the new version misbehaves.
+It keeps going when your laptop disconnects, and picks up where it left off if the agent
+itself restarts.
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o appdeploy-linux-amd64 ./cmd/appdeploy
-scp appdeploy-linux-amd64 scripts/install.sh ~/.ssh/id_ed25519.pub root@server:
-ssh root@server ./install.sh --binary ./appdeploy-linux-amd64 --ssh-key-file ./id_ed25519.pub
-```
-
-Then, from your laptop (point the DNS name at the server first):
-
-```bash
-appdeploy --host deploy@server apps create myapp --domain myapp.example.com
-git remote add prod deploy@server:myapp
+git remote add prod deploy@my-server:myapp
 git push prod main
 ```
 
-Any repository with a `Dockerfile` works; the app listens on `$PORT` (default 8080) and
-answers `GET /up` with a 2xx. An optional `appdeploy.yml` overrides defaults (SPEC.md §6).
-
-After the switch the old release keeps running for `watch.window` (3 minutes by default)
-while the new one is watched; `git push` reports `succeeded` when the window ends.
-Set `watch: {window: 30s}` if that is too long for your app.
-
-## Commands
-
 ```
-appdeploy [--host user@server] status [app]
-appdeploy deploy|redeploy|rollback <app>
-appdeploy logs <app> [--role web] [-f]
-appdeploy exec <app> -- <cmd...>
-appdeploy secrets set|unset|list|export <app> ...
-appdeploy db backup|list|restore <app>
-appdeploy deploy <app> --image REGISTRY/IMAGE:TAG     deploy an image built elsewhere
-appdeploy export <app> --format kamal|compose|k8s|fly   leave: the same setup for another tool
-appdeploy domains set <app> <domain>...
+remote: ==> validating
+remote: ==> building
+remote: ==> starting
+remote: ==> verifying
+remote: myapp-v2-web-1: healthcheck GET /up ok
+remote: ==> switching
+remote: ==> observing
+remote: ==> succeeded: myapp is now serving v2
 ```
 
-## Releases and updates
+> **Status: early (v0.1).** The core is covered by an end-to-end test suite that runs real
+> Docker and Caddy, but appdeploy has not been used in production yet and the install script
+> has not been run on a real Linux server. Read [what it does not do](docs/comparison.md#what-appdeploy-does-not-do)
+> before you choose it.
 
-A tag `vX.Y.Z` builds, signs and publishes binaries on GitHub (SPEC.md §27). Servers update
-themselves: `appdeploy --host deploy@server self-update` installs the latest release if
-its signature matches the key built into the running binary; the agent restarts into it and
-keeps the apps running. Setting up the signing key is a one-time step described in
-`.github/workflows/release.yml` (one repository secret, `RELEASE_SIGNING_KEY`).
+## Why appdeploy
 
-A whole group updates itself from one command on the founder: `appdeploy group set-version
-v1.3.0`. Servers install it one at a time in name order, waiting while anything is deploying;
-a version that fails to start is reverted automatically. `appdeploy group servers` shows
-progress.
+- **The server drives the deploy, not your laptop.** Close the lid, lose Wi-Fi, kill `git push`:
+  the deploy finishes anyway. If the agent crashes mid-switch, it finishes or reverts on restart.
+- **Rollback by real traffic, not just a health check.** After the switch the old version stays
+  up while the new one is watched. Too many 5xx, crash loops or failing health checks put
+  traffic back on the old version in one proxy switch.
+- **No registry, no cross-building.** Images are built on the server (or on a build server)
+  and sent between your servers directly.
+- **Small groups without Kubernetes.** 1 to about 10 servers: roles placed by labels, canary
+  first, a failed rollout is undone, a server that was down catches up by itself.
+- **Easy to leave.** `appdeploy export` writes the same setup for Kamal, Docker Compose,
+  Kubernetes or Fly. Your app only needs a Dockerfile, environment variables and `GET /up`.
+- **Batteries for small apps:** Postgres and Redis per app with daily backups, secrets per
+  release, webhooks (Slack, Telegram, generic), signed self-update, SSH roles.
+
+How it compares to Kamal, Dokku, Coolify and others: [docs/comparison.md](docs/comparison.md).
+
+## Documentation
+
+| | |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install on a server, deploy your first app |
+| [Concepts](docs/concepts.md) | How a deploy works, what a release is, what the watchdog does |
+| [Commands](docs/commands.md) | Every command of the CLI |
+| [Configuration](docs/configuration.md) | `appdeploy.yml`, agent flags, files on disk |
+| [Server groups](docs/groups.md) | Several servers, labels, build servers, updating a group |
+| [Operations](docs/operations.md) | Backups, secrets, updates, security, monitoring |
+| [Troubleshooting](docs/troubleshooting.md) | Error messages and what to do |
+| [Migration](docs/migration.md) | From Kamal, Compose, Dokku, Fly, and away from appdeploy |
+| [Comparison](docs/comparison.md) | When to choose appdeploy and when not to |
+| [HTTP API](docs/api.md) | The agent's JSON API |
+| [Guide for AI assistants](docs/llm-guide.md) | Rules for LLMs and agents operating appdeploy ([llms.txt](llms.txt)) |
+| [Design](SPEC.md) | The design document and what is implemented |
+
+## Quick start
+
+On a Debian or Ubuntu server with systemd, as root, with the binary and `install.sh` of one
+[release](https://github.com/merkushin/appdeploy/releases) (download steps in
+[Getting started](docs/getting-started.md#1-get-the-binary-and-the-install-script)):
+
+```bash
+./install.sh --binary ./appdeploy-linux-amd64 --ssh-key-file ./my-key.pub
+```
+
+On your computer, with the `appdeploy` binary from the same release:
+
+```bash
+appdeploy --host deploy@my-server apps create myapp --domain myapp.example.com
+git remote add prod deploy@my-server:myapp
+git push prod main
+```
+
+The full walkthrough, including DNS and what your app must provide, is in
+[Getting started](docs/getting-started.md).
 
 ## Development
 
 ```bash
 go test ./...                              # unit tests
-go test -tags e2e -timeout 30m ./e2e       # end-to-end: needs Docker; pulls golang:1.27-alpine and caddy:2
+go test -tags e2e -timeout 40m ./e2e       # end-to-end: needs Docker; pulls golang:1.27-alpine, caddy:2, postgres and redis
 ```
 
-The e2e tests start their own agent and Caddy, deploy the Go apps in `examples/`, and remove
-every container, image, network and directory they create. Set `E2E_KEEP=1` to keep the
-temp directory (with `agent.log`) for debugging.
+The end-to-end tests start their own agent and Caddy, deploy the Go apps in `examples/`, and
+remove every container, image, network, volume and directory they create. Set `E2E_KEEP=1`
+to keep the temp directory (with `agent.log`) when debugging. The documentation is checked
+against the code by `go test ./internal/docs` (commands, configuration keys, agent flags, API
+routes, links, examples and the error messages the docs quote); if you change `README.md` or
+`docs/`, regenerate `llms-full.txt` with `UPDATE_DOCS=1 go test ./internal/docs`. Releases are described in
+[SPEC.md §27](SPEC.md).
