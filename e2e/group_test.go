@@ -392,3 +392,48 @@ func TestGroupCoordinatorCrashResumes(t *testing.T) {
 		return g.a.roles(t, "gcrash") == "web:v2" && g.b.roles(t, "gcrash") == "web:v2" && g.c.roles(t, "gcrash") == "worker:v2"
 	})
 }
+
+// A server that is down during a rollout is skipped when the app allows it,
+// refused otherwise, and brings itself up to date when it is back.
+func TestGroupServerCatchesUpAfterDowntime(t *testing.T) {
+	g := needGroup(t)
+	g.a.newApp(t, "gcatch")
+	r := env.newRepo(t, "hello")
+	r.write("appdeploy.yml", groupConfig+"allow_partial: true\n")
+	r.commit("v1")
+	if out, err := r.gpush(g.a, "gcatch"); err != nil || !strings.Contains(out, "==> succeeded") {
+		t.Fatalf("v1: %v\n%s", err, out)
+	}
+	waitFor(t, 20*time.Second, "c to run the worker", func() bool { return g.c.roles(t, "gcatch") == "worker:v1" })
+
+	g.c.stop(syscall.SIGKILL)
+
+	// With allow_partial the others get the release and the missing server is named.
+	r.write("message.txt", "hello v2\n")
+	r.commit("v2")
+	out, _ := r.gpush(g.a, "gcatch")
+	contains(t, out, "WARNING: skipping c")
+	contains(t, out, "==> succeeded")
+	g.a.expectWeb(t, "gcatch", "hello v2")
+	g.b.expectWeb(t, "gcatch", "hello v2")
+
+	// Without it, an unreachable server stops the deploy before anything changes.
+	r.write("appdeploy.yml", groupConfig)
+	r.write("message.txt", "hello v3\n")
+	r.commit("v3 without allow_partial")
+	out, _ = r.gpush(g.a, "gcatch")
+	contains(t, out, "server c is not reachable")
+	g.a.expectWeb(t, "gcatch", "hello v2")
+
+	// When c is back it finds out what the group runs and runs its part of it.
+	g.c.start(t)
+	waitFor(t, 90*time.Second, "c to catch up to v2", func() bool { return g.c.roles(t, "gcatch") == "worker:v2" })
+	s := env.status2(t, g.c, "gcatch")
+	if s.App.CurrentRelease != 2 {
+		t.Errorf("c is on v%d, want v2", s.App.CurrentRelease)
+	}
+	// The build server carries no role label, so it catches up with nothing.
+	if got := g.d.roles(t, "gcatch"); !strings.HasPrefix(got, "none running") {
+		t.Errorf("the builder runs %q", got)
+	}
+}
