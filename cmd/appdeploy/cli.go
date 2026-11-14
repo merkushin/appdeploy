@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +103,8 @@ func clientRun(socket string, args []string) int {
 		code, err = cmdSecrets(ctx, c, rest)
 	case "group":
 		code, err = cmdGroup(ctx, c, rest)
+	case "export":
+		code, err = cmdExport(ctx, c, rest)
 	case "db":
 		code, err = cmdDB(ctx, c, rest)
 	case "domains":
@@ -400,6 +403,47 @@ func cmdDB(ctx context.Context, c *api.Client, args []string) (int, error) {
 		fmt.Println("restored", args[2])
 	default:
 		return 2, fmt.Errorf("unknown db command %q", args[0])
+	}
+	return 0, nil
+}
+
+func cmdExport(ctx context.Context, c *api.Client, args []string) (int, error) {
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	format := fs.String("format", "", "kamal, compose, k8s or fly")
+	out := fs.String("out", "", "write the files into this directory instead of printing them")
+	pos, err := parseFlags(fs, args)
+	if err != nil || len(pos) != 1 || *format == "" {
+		return 2, fmt.Errorf("usage: export <app> --format kamal|compose|k8s|fly [--out dir]")
+	}
+	files, err := c.Export(ctx, pos[0], *format)
+	if err != nil {
+		return 1, err
+	}
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if *out == "" {
+			fmt.Printf("==> %s <==\n%s\n", n, files[n])
+			continue
+		}
+		path := filepath.Join(*out, n)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return 1, err
+		}
+		mode := os.FileMode(0o644)
+		switch {
+		case strings.HasSuffix(n, ".sh"):
+			mode = 0o755
+		case strings.Contains(n, "secrets") || strings.HasSuffix(n, ".env.example"):
+			mode = 0o600
+		}
+		if err := os.WriteFile(path, []byte(files[n]), mode); err != nil {
+			return 1, err
+		}
+		fmt.Println("wrote", path)
 	}
 	return 0, nil
 }

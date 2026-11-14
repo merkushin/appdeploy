@@ -38,6 +38,7 @@ Client side (talks to the agent; --host runs it on a remote server over SSH):
   secrets unset <app> KEY... [--no-deploy]
   secrets list <app>
   secrets export <app>
+  export <app> --format kamal|compose|k8s|fly [--out dir]   the app's setup for another tool
   db backup|list <app>             Postgres backups (daily, kept 7 days + 4 weeks)
   db restore <app> <name>          replace the app's database with a backup
   domains set <app> <domain>...

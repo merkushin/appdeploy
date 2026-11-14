@@ -286,3 +286,12 @@ func (c *Client) GroupInvite(ctx context.Context) (string, error) {
 func (c *Client) GroupRemove(ctx context.Context, name string) error {
 	return c.call(ctx, "DELETE", "/v1/group/servers/"+name, nil, nil)
 }
+
+// Export returns the files of the app's configuration for another tool, by path.
+func (c *Client) Export(ctx context.Context, app, format string) (map[string]string, error) {
+	var out struct {
+		Files map[string]string `json:"files"`
+	}
+	err := c.call(ctx, "GET", "/v1/apps/"+app+"/export?format="+format, nil, &out)
+	return out.Files, err
+}

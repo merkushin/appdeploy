@@ -13,8 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"appdeploy/internal/config"
 	"appdeploy/internal/deploy"
 	"appdeploy/internal/docker"
+	"appdeploy/internal/export"
 	"appdeploy/internal/group"
 	"appdeploy/internal/services"
 	"appdeploy/internal/store"
@@ -83,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/apps/{app}/db/backup", s.dbBackup)
 	mux.HandleFunc("GET /v1/apps/{app}/db/backups", s.dbBackups)
 	mux.HandleFunc("POST /v1/apps/{app}/db/restore", s.dbRestore)
+	mux.HandleFunc("GET /v1/apps/{app}/export", s.export)
 	mux.HandleFunc("GET /v1/group", s.groupInfo)
 	mux.HandleFunc("POST /v1/group/invite", s.groupInvite)
 	mux.HandleFunc("DELETE /v1/group/servers/{name}", s.groupRemove)
@@ -689,4 +692,53 @@ func (s *Server) groupRemove(w http.ResponseWriter, r *http.Request) {
 		go s.Peer.Broadcast(context.Background(), st)
 	}
 	writeJSON(w, 200, st)
+}
+
+// ---- export ----
+
+// export renders the app's live release as the configuration of another tool.
+// It contains the names of secrets, never their values.
+func (s *Server) export(w http.ResponseWriter, r *http.Request) {
+	a, err := s.St.GetApp(r.PathValue("app"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if a.CurrentRelease == 0 {
+		writeErr(w, errors.New("the app has no release yet; deploy it first"))
+		return
+	}
+	rel, err := s.St.GetRelease(a.Name, a.CurrentRelease)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	cfg, err := config.FromJSON(rel.Config)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	names, err := s.Eng.SecretNames(a.Name)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	seen := map[string]bool{}
+	var domains []string
+	for _, d := range append(append([]string{}, a.Domains...), cfg.Domains...) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			domains = append(domains, d)
+		}
+	}
+	spec := export.Spec{App: a.Name, Release: a.CurrentRelease, Config: cfg, Domains: domains, SecretNames: names}
+	if s.Group != nil {
+		spec.Servers = s.Group.State().Servers
+	}
+	files, err := export.Render(r.URL.Query().Get("format"), spec)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"files": files})
 }

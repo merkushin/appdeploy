@@ -854,3 +854,46 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	waitFor(t, 10*time.Second, "503 after the container stopped", func() bool { return url("lb") == 503 })
 }
+
+// Leaving is one command: the live app's setup comes out in the format of
+// another tool, with the names of its secrets and never their values.
+func TestExportToOtherTools(t *testing.T) {
+	e := env
+	e.newApp(t, "exp", "exp.test")
+	r := e.newRepo(t, "hello")
+	r.write("appdeploy.yml", "roles:\n  web:\n    port: 8080\n    memory: 96M\n")
+	r.commit("config")
+	if out, err := r.push("exp"); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	e.mustAd(t, "secrets", "set", "exp", "API_TOKEN=hunter2-never-exported")
+
+	for _, format := range []string{"kamal", "compose", "k8s", "fly"} {
+		out := e.mustAd(t, "export", "exp", "--format", format)
+		contains(t, out, "API_TOKEN")
+		contains(t, out, "exp.test")
+		notContains(t, out, "hunter2-never-exported")
+	}
+	dir := filepath.Join(t.TempDir(), "out")
+	e.mustAd(t, "export", "exp", "--format", "compose", "--out", dir)
+	for _, f := range []string{"compose.yml", ".env.example", "Caddyfile"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Errorf("missing %s: %v", f, err)
+		}
+	}
+	// The instructions in the file: copy .env.example to .env and fill it in.
+	example, _ := os.ReadFile(filepath.Join(dir, ".env.example"))
+	if err := os.WriteFile(filepath.Join(dir, ".env"), example, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := sh("docker", "compose", "-f", filepath.Join(dir, "compose.yml"), "config", "--quiet"); err != nil {
+		t.Errorf("docker compose rejected the exported file: %v\n%s", err, out)
+	}
+	if out, err := e.ad("export", "exp", "--format", "terraform"); err == nil || !strings.Contains(out, "unknown format") {
+		t.Errorf("unknown format: %v %s", err, out)
+	}
+	e.newApp(t, "fresh", "fresh.test")
+	if out, err := e.ad("export", "fresh", "--format", "kamal"); err == nil || !strings.Contains(out, "no release") {
+		t.Errorf("app without a release: %v %s", err, out)
+	}
+}
