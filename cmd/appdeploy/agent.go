@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,7 +13,6 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -53,6 +50,8 @@ func runAgent(args []string) int {
 	monitorEvery := fs.Duration("monitor-every", 30*time.Second, "how often to look for crashed containers and low disk space (0 = never)")
 	updateRepoFlag := fs.String("update-repo", updateRepo, "GitHub repository (owner/name) that publishes releases for self-update")
 	updateAPI := fs.String("update-api", "", "GitHub API URL for self-update (default https://api.github.com; for tests)")
+	updateEvery := fs.Duration("update-check-every", time.Minute, "how often a group member checks whether it is its turn to install the group's desired version (0 = never)")
+	confirmDelay := fs.Duration("update-confirm-after", time.Minute, "how long a freshly updated agent must stay healthy before the update counts as good")
 	peerListen := fs.String("peer-listen", "", "address of the peer API (default: the port of this server's advertised address)")
 	backupEvery := fs.Duration("backup-every", 24*time.Hour, "back up every app's Postgres database this often (0 = never)")
 	var notifyURLs stringList
@@ -61,6 +60,9 @@ func runAgent(args []string) int {
 	minFreeFrac := fs.Float64("min-free-frac", 0, "refuse to build with less free disk fraction than this (default 0.10)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if testFailStart != "" {
+		return die("this build was made to fail at start (test hook)")
 	}
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("appdeployd: ")
@@ -152,21 +154,10 @@ func runAgent(args []string) int {
 		defer hsrv.Close()
 	}
 	ctl := &api.Server{Eng: eng, St: st, Dk: dk, Svc: svc, Group: grp}
+	upd := &updater{dataDir: *dataDir, repo: *updateRepoFlag, api: *updateAPI}
+	ctl.Version = version
 	ctl.SelfUpdate = func(uctx context.Context, check, force bool, repo string, logf func(string)) (update.Result, error) {
-		pub, perr := base64.StdEncoding.DecodeString(updatePublicKey)
-		if repo == "" {
-			repo = *updateRepoFlag
-		}
-		exe, _ := os.Executable()
-		if perr != nil || len(pub) != ed25519.PublicKeySize {
-			return update.Result{}, errors.New("this binary was built without a release signing key, so it cannot verify updates")
-		}
-		return update.Run(uctx, update.Options{
-			API: *updateAPI, Repo: repo, PublicKey: ed25519.PublicKey(pub), Current: version,
-			OS: runtime.GOOS, Arch: runtime.GOARCH, Exe: exe, Force: force, CheckOnly: check,
-			Token: os.Getenv("APPDEPLOY_UPDATE_TOKEN"),
-			Log:   func(format string, a ...any) { logf(fmt.Sprintf(format, a...)) },
-		})
+		return upd.install(uctx, check, force, repo, "", logf)
 	}
 	// The service manager starts the new binary: exit cleanly once the reply is out.
 	ctl.AfterUpdate = func() { time.AfterFunc(time.Second, stop) }
@@ -202,6 +193,15 @@ func runAgent(args []string) int {
 	}
 	if grp != nil {
 		go eng.RunCatchUp(ctx, 30*time.Second)
+		if *updateEvery > 0 {
+			go upd.runLoop(ctx, *updateEvery, grp, st, &api.PeerClient{Group: grp}, stop)
+		}
+	}
+	go confirmAfter(ctx, *confirmDelay, *dataDir, api.NewClient(*socket))
+	if f, ok := update.ReadFailed(*dataDir); ok && !f.Notified {
+		log.Printf("the last update was reverted: %s", f.Reason)
+		eng.NotifyGlobal(notify.UpdateFailed, "", f.Reason)
+		update.MarkFailedNotified(*dataDir)
 	}
 	log.Printf("agent %s ready: socket %s, data %s, instance %q", version, *socket, *dataDir, *instance)
 

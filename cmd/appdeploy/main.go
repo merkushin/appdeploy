@@ -48,7 +48,8 @@ Client side (talks to the agent; --host runs it on a remote server over SSH):
   db restore <app> <name>          replace the app's database with a backup
   domains set <app> <domain>...
   group init|join ...              create a group of servers / join one (before starting the agent)
-  group invite|servers             invite a server / list members
+  group invite|servers             invite a server / list members with their agent versions
+  group set-version <vX.Y.Z|none>  have every server install that release, one at a time
   group remove <name>
   self-update [--check] [--force] [--repo owner/name]   install the latest signed release (admin)
   version
@@ -67,6 +68,8 @@ func main() {
 		os.Exit(runHook(args[1:]))
 	case "shell":
 		os.Exit(runShell(args[1:]))
+	case "recover":
+		os.Exit(runRecover(args[1:]))
 	case "version", "--version":
 		fmt.Println("appdeploy", version)
 		return

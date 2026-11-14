@@ -60,7 +60,7 @@ func runGroupOffline(args []string) int {
 
 func cmdGroup(ctx context.Context, c *api.Client, args []string) (int, error) {
 	if len(args) == 0 {
-		return 2, fmt.Errorf("usage: group invite|servers|remove <name>")
+		return 2, fmt.Errorf("usage: group invite|servers|set-version|remove <name>")
 	}
 	switch args[0] {
 	case "invite":
@@ -71,16 +71,44 @@ func cmdGroup(ctx context.Context, c *api.Client, args []string) (int, error) {
 		fmt.Println("On the new server, run (valid for one hour, once):")
 		fmt.Printf("  appdeploy group join --server <name> --advertise <host:7070> --labels web --token %s\n", tok)
 	case "servers":
-		st, err := c.Group(ctx)
+		gv, err := c.GroupVersions(ctx)
 		if err != nil {
 			return 1, err
 		}
+		if gv.Desired != "" {
+			fmt.Printf("desired agent version: %s\n", gv.Desired)
+		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintf(tw, "SERVER\tADDRESS\tLABELS\n")
-		for _, s := range st.Servers {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Name, s.Addr, strings.Join(s.Labels, ","))
+		fmt.Fprintf(tw, "SERVER\tADDRESS\tLABELS\tVERSION\tSTATE\n")
+		for _, s := range gv.Servers {
+			state, ver := "ok", s.Version
+			switch {
+			case !s.Reachable:
+				state, ver = "unreachable", "-"
+			case s.Busy:
+				state = "deploying"
+			case gv.Desired != "" && !strings.HasSuffix(gv.Desired, s.Version):
+				state = "waiting for its turn to update"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Addr, strings.Join(s.Labels, ","), ver, state)
 		}
 		tw.Flush()
+	case "set-version":
+		if len(args) != 2 {
+			return 2, fmt.Errorf("usage: group set-version <vX.Y.Z | none>")
+		}
+		v := args[1]
+		if v == "none" || v == "-" {
+			v = ""
+		}
+		if err := c.GroupSetVersion(ctx, v); err != nil {
+			return 1, err
+		}
+		if v == "" {
+			fmt.Println("no version is wanted any more; servers stay as they are")
+		} else {
+			fmt.Printf("every server will install %s, one at a time in name order; watch with: appdeploy group servers\n", v)
+		}
 	case "remove":
 		if len(args) != 2 {
 			return 2, fmt.Errorf("usage: group remove <name>")

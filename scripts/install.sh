@@ -147,8 +147,12 @@ Description=appdeploy agent
 After=network-online.target docker.service appdeploy-caddy.service
 Requires=docker.service
 Wants=appdeploy-caddy.service
+# Never give up restarting: `recover` has to run again for a failed update to be reverted.
+StartLimitIntervalSec=0
 
 [Service]
+# Before each start: if a freshly installed version keeps failing to start, go back to the old binary.
+ExecStartPre=-/usr/local/bin/appdeploy recover --data-dir /var/lib/appdeploy
 # --access-log: Caddy writes it, the agent follows it for the rollback watchdog.
 ExecStart=/usr/local/bin/appdeploy agent --data-dir /var/lib/appdeploy --socket /run/appdeploy/agent.sock --socket-group appdeploy --repo-owner deploy --access-log /var/log/appdeploy/access.log --prune-build-cache 168h --health-listen :7071
 RuntimeDirectory=appdeploy

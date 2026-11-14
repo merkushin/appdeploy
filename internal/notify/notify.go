@@ -22,6 +22,7 @@ const (
 	MigrationSuspect = "migration.suspect"
 	BackupFailed     = "backup.failed"
 	AppCrashed       = "app.crashed"
+	UpdateFailed     = "agent.update_failed"
 	DiskLow          = "disk.low"
 )
 
@@ -53,6 +54,8 @@ func (e Event) Text() string {
 		return base + "deploy FAILED: " + e.Error
 	case DeployRolledBack:
 		return base + "ROLLED BACK automatically: " + e.Error
+	case UpdateFailed:
+		return "[appdeploy] an agent update was reverted: " + e.Error
 	case AppCrashed:
 		return fmt.Sprintf("[appdeploy] %s: %s", e.App, e.Error)
 	case DiskLow:
