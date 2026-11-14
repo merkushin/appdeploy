@@ -570,6 +570,14 @@ func TestPushAndCLIOverSSH(t *testing.T) {
 	contains(t, string(out), "==> succeeded")
 	e.expectBody(t, "viassh.test", "/", "hello v1")
 
+	// The repository on the server is an ordinary git repository: it can be cloned
+	// (docs/migration.md promises it), by roles that may read source, not by a viewer.
+	clone := exec.Command("git", "clone", "-q", "deploy@testhost:viassh", filepath.Join(t.TempDir(), "clone"))
+	clone.Env = append(os.Environ(), "GIT_SSH_COMMAND="+fake)
+	if out, err := clone.CombinedOutput(); err != nil {
+		t.Errorf("git clone over ssh: %v\n%s", err, out)
+	}
+
 	// The client CLI reaches the server with --host.
 	cli := exec.Command(e.bin, "--host", "deploy@testhost", "status", "viassh")
 	cli.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
@@ -1012,6 +1020,15 @@ func TestDeployPrebuiltImage(t *testing.T) {
 	e.expectBody(t, "ci.test", "/", "ci one")
 	if out, err := e.ad("deploy", "ci", "--image", v2, "--config", cfgPath+".missing"); err == nil {
 		t.Errorf("a missing config file was accepted: %s", out)
+	}
+	// The config can come from standard input (how CI sends it with --host).
+	cmd := exec.Command(e.bin, "--socket", e.socket, "deploy", "ci", "--image", v2, "--config", "-")
+	cmd.Stdin = strings.NewReader("roles:\n  web:\n    memory: 80M\n")
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "==> succeeded") {
+		t.Fatalf("--config -: %v\n%s", err, out)
+	}
+	if s := e.status(t, "ci"); s.App.CurrentRelease < 3 {
+		t.Errorf("the deploy with a config from stdin did not become a release: v%d", s.App.CurrentRelease)
 	}
 }
 

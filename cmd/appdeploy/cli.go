@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -242,7 +243,7 @@ func cmdDeploy(ctx context.Context, c *api.Client, kind string, args []string) (
 	ref := fs.String("ref", "", "git ref or commit (deploy only)")
 	to := fs.Int("to", 0, "release number (rollback only; default: the previous one)")
 	image := fs.String("image", "", "deploy this prebuilt image instead of building (deploy only)")
-	cfgFile := fs.String("config", "", "appdeploy.yml to use with --image (default: the live release's config)")
+	cfgFile := fs.String("config", "", "appdeploy.yml to use with --image, or - to read it from standard input (default: the live release's config)")
 	detach := fs.Bool("detach", false, "do not wait for the deploy to finish")
 	pos, err := parseFlags(fs, args)
 	if err != nil || len(pos) != 1 {
@@ -254,7 +255,13 @@ func cmdDeploy(ctx context.Context, c *api.Client, kind string, args []string) (
 		if *image != "" {
 			yaml := ""
 			if *cfgFile != "" {
-				b, rerr := os.ReadFile(*cfgFile)
+				var b []byte
+				var rerr error
+				if *cfgFile == "-" { // from standard input: the way to send a file from CI with --host
+					b, rerr = io.ReadAll(os.Stdin)
+				} else {
+					b, rerr = os.ReadFile(*cfgFile)
+				}
 				if rerr != nil {
 					return 1, rerr
 				}

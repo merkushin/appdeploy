@@ -29,11 +29,12 @@ Server side:
 Client side (talks to the agent; --host runs it on a remote server over SSH):
   appdeploy [--host user@host] [--socket path] <command>
 
+  ping                             check that the agent answers (no output, exit status 0)
   apps create <app> [--domain d]... [--branch main]
   apps list
   apps destroy <app>
   status [<app>]
-  deploy <app> [--ref sha | --image ref [--config appdeploy.yml]] [--detach]
+  deploy <app> [--ref sha | --image ref [--config appdeploy.yml|-]] [--detach]
   redeploy <app> [--detach]        redeploy the current image with current secrets
   rollback <app> [--to N] [--detach]
   releases <app>
