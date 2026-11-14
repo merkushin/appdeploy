@@ -1,8 +1,10 @@
 package deploy
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -292,4 +294,151 @@ func removeAll(p string) error {
 		return nil
 	}
 	return os.RemoveAll(p)
+}
+
+// ---- source transfer (to a build server) ----
+
+// tarDir writes dir as a gzip-compressed tar stream: regular files, directories
+// and symlinks only.
+func tarDir(w io.Writer, dir string) error {
+	zw := gzip.NewWriter(w)
+	tw := tar.NewWriter(zw)
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil || rel == "." {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		link := ""
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			if link, err = os.Readlink(p); err != nil {
+				return err
+			}
+		case !info.Mode().IsRegular() && !info.IsDir():
+			return nil // sockets, devices and the like are not part of a build context
+		}
+		h, err := tar.FileInfoHeader(info, link)
+		if err != nil {
+			return err
+		}
+		h.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(h); err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			f, err := os.Open(p)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = io.Copy(tw, f)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return zw.Close()
+}
+
+// maxSourceBytes bounds how much a peer may make this server unpack.
+const maxSourceBytes = 4 << 30
+
+// untarTo unpacks a stream made by tarDir into dir. Names that leave dir and
+// links that point out of it are refused: the stream comes from another server.
+func untarTo(r io.Reader, dir string) error {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(io.LimitReader(zr, maxSourceBytes))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target, err := insideDir(dir, h.Name)
+		if err != nil {
+			return fmt.Errorf("unsafe path %q in the source archive", h.Name)
+		}
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(h.Mode)&0o777|0o600)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			dest := h.Linkname
+			if !filepath.IsAbs(dest) {
+				dest = filepath.Join(filepath.Dir(target), dest)
+			}
+			if _, err := insideDir(dir, mustRel(dir, dest)); err != nil || filepath.IsAbs(h.Linkname) {
+				return fmt.Errorf("link %q points outside the source archive", h.Name)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Symlink(h.Linkname, target); err != nil {
+				return err
+			}
+		default:
+			// Hard links, devices and the rest are not part of a build context.
+			return fmt.Errorf("unsupported entry %q in the source archive", h.Name)
+		}
+	}
+}
+
+func mustRel(base, target string) string {
+	r, err := filepath.Rel(base, target)
+	if err != nil {
+		return ".."
+	}
+	return r
+}
+
+// srcDir is where a build server keeps the source it was sent.
+func (e *Engine) srcDir(app string, release int) string {
+	return filepath.Join(e.appDir(app), "build", fmt.Sprintf("src-%d", release))
+}
+
+// ReceiveSource unpacks the source of a release that this server is to build.
+func (e *Engine) ReceiveSource(app string, release int, r io.Reader) error {
+	dir := e.srcDir(app, release)
+	_ = os.RemoveAll(dir)
+	if err := untarTo(r, dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	return nil
 }

@@ -1,6 +1,9 @@
 package deploy
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -177,6 +180,59 @@ func TestPlanWaves(t *testing.T) {
 	for n, want := range cases {
 		if got := planWaves(n); !reflect.DeepEqual(got, want) {
 			t.Errorf("planWaves(%d) = %v, want %v", n, got, want)
+		}
+	}
+}
+
+func TestTarRoundTripAndHostileArchives(t *testing.T) {
+	src := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(src, "Dockerfile"), []byte("FROM scratch\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(src, "sub", "run.sh"), []byte("#!/bin/sh\n"), 0o755)
+	_ = os.Symlink("sub/run.sh", filepath.Join(src, "link"))
+
+	var buf bytes.Buffer
+	if err := tarDir(&buf, src); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "out")
+	if err := untarTo(bytes.NewReader(buf.Bytes()), dst); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "Dockerfile")); string(b) != "FROM scratch\n" {
+		t.Errorf("Dockerfile = %q", b)
+	}
+	if st, err := os.Stat(filepath.Join(dst, "sub", "run.sh")); err != nil || st.Mode().Perm()&0o100 == 0 {
+		t.Errorf("the executable bit was lost: %v %v", st, err)
+	}
+	if l, err := os.Readlink(filepath.Join(dst, "link")); err != nil || l != "sub/run.sh" {
+		t.Errorf("symlink = %q %v", l, err)
+	}
+
+	evil := func(build func(tw *tar.Writer)) error {
+		var b bytes.Buffer
+		zw := gzip.NewWriter(&b)
+		tw := tar.NewWriter(zw)
+		build(tw)
+		tw.Close()
+		zw.Close()
+		return untarTo(&b, filepath.Join(t.TempDir(), "x"))
+	}
+	for name, f := range map[string]func(*tar.Writer){
+		"path traversal": func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: "../escape", Mode: 0o644, Size: 1, Typeflag: tar.TypeReg})
+			tw.Write([]byte("x"))
+		},
+		"absolute link": func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: "l", Linkname: "/etc/passwd", Typeflag: tar.TypeSymlink})
+		},
+		"link out": func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: "l", Linkname: "../../x", Typeflag: tar.TypeSymlink})
+		},
+		"device": func(tw *tar.Writer) { tw.WriteHeader(&tar.Header{Name: "d", Typeflag: tar.TypeChar}) },
+	} {
+		if err := evil(f); err == nil {
+			t.Errorf("%s was accepted", name)
 		}
 	}
 }
