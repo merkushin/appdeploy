@@ -47,8 +47,8 @@ type Remote interface {
 	SendSource(ctx context.Context, srv group.Server, app string, release int, body io.Reader) error
 	// FetchImage streams the built release image (gzip-compressed `docker save`) from a build server.
 	FetchImage(ctx context.Context, srv group.Server, app string, release int) (io.ReadCloser, error)
-	// Ping checks that the server answers.
-	Ping(ctx context.Context, srv group.Server) error
+	// Ping checks that the server answers and returns the protocol it speaks (0 if it does not say).
+	Ping(ctx context.Context, srv group.Server) (protocol int, err error)
 	// Announce tells the server that a rollout completed; Finals lists what it knows of those.
 	Announce(ctx context.Context, srv group.Server, f store.Final) error
 	Finals(ctx context.Context, srv group.Server) ([]store.Final, error)
@@ -654,8 +654,12 @@ func (r *run) reachable(targets []group.Server) ([]group.Server, error) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
-		err := e.opt.Remote.Ping(ctx, t)
+		proto, err := e.opt.Remote.Ping(ctx, t)
 		cancel()
+		if err == nil && proto != group.Protocol {
+			// Reachable but incompatible: the group is being updated. Waiting is the only safe choice.
+			return nil, fmt.Errorf("server %s speaks protocol %d and this one %d: the group is being updated; try again when every server runs the same version", t.Name, proto, group.Protocol)
+		}
 		switch {
 		case err == nil:
 			ok = append(ok, t)

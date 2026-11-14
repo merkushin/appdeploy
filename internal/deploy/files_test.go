@@ -1,10 +1,16 @@
 package deploy
 
 import (
+	"appdeploy/internal/config"
 	"appdeploy/internal/docker"
+	"appdeploy/internal/group"
+	"appdeploy/internal/store"
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -301,5 +307,71 @@ func TestAlerterDiskHasHysteresis(t *testing.T) {
 	a.disk(40*gb, 100*gb, 5*gb, 0.10)
 	if m := a.disk(2*gb, 100*gb, 5*gb, 0.10); m == "" {
 		t.Errorf("a new low-disk incident was not reported after recovery")
+	}
+}
+
+// fakeRemote answers Ping only; the rollout guard needs nothing else.
+type fakeRemote struct {
+	protocol map[string]int
+	down     map[string]bool
+}
+
+func (f fakeRemote) Ping(_ context.Context, s group.Server) (int, error) {
+	if f.down[s.Name] {
+		return 0, errors.New("connection refused")
+	}
+	return f.protocol[s.Name], nil
+}
+func (fakeRemote) SendImage(context.Context, group.Server, string, int, io.Reader) error  { return nil }
+func (fakeRemote) SendSource(context.Context, group.Server, string, int, io.Reader) error { return nil }
+func (fakeRemote) FetchImage(context.Context, group.Server, string, int) (io.ReadCloser, error) {
+	return nil, errors.New("not used")
+}
+func (fakeRemote) Announce(context.Context, group.Server, store.Final) error   { return nil }
+func (fakeRemote) Finals(context.Context, group.Server) ([]store.Final, error) { return nil, nil }
+func (fakeRemote) FetchRelease(context.Context, group.Server, string, int) (PeerPayload, error) {
+	return PeerPayload{}, errors.New("not used")
+}
+func (fakeRemote) StartDeploy(context.Context, group.Server, PeerPayload) (string, error) {
+	return "", errors.New("not used")
+}
+func (fakeRemote) StreamDeploy(context.Context, group.Server, string, func(string)) (string, string, error) {
+	return "", "", errors.New("not used")
+}
+
+func TestRolloutRefusesServersOnAnotherProtocol(t *testing.T) {
+	g, err := group.Init(t.TempDir(), "g", "a", "127.0.0.1:1", []string{"web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := group.Server{Name: "b", Addr: "127.0.0.1:2", Labels: []string{"web"}}
+	self := group.Server{Name: "a", Addr: "127.0.0.1:1", Labels: []string{"web"}}
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	run := func(remote fakeRemote, allowPartial bool) ([]group.Server, error) {
+		e := &Engine{ctx: context.Background(), st: st, opt: Options{Group: g, Remote: remote}}
+		r := &run{e: e, cfg: &config.App{AllowPartial: allowPartial}}
+		return r.reachable([]group.Server{self, b})
+	}
+	same := fakeRemote{protocol: map[string]int{"b": group.Protocol}}
+	if got, err := run(same, false); err != nil || len(got) != 2 {
+		t.Fatalf("matching protocol: %v %v", got, err)
+	}
+	other := fakeRemote{protocol: map[string]int{"b": group.Protocol + 1}}
+	for _, partial := range []bool{false, true} {
+		// Even allow_partial does not skip a server that is reachable but incompatible.
+		if _, err := run(other, partial); err == nil || !strings.Contains(err.Error(), "being updated") {
+			t.Errorf("a different protocol (partial=%v): %v", partial, err)
+		}
+	}
+	down := fakeRemote{down: map[string]bool{"b": true}}
+	if _, err := run(down, false); err == nil || !strings.Contains(err.Error(), "not reachable") {
+		t.Errorf("an unreachable server: %v", err)
+	}
+	if got, err := run(down, true); err != nil || len(got) != 1 || got[0].Name != "a" {
+		t.Errorf("allow_partial: %v %v", got, err)
 	}
 }

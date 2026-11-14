@@ -39,7 +39,11 @@ func (p *PeerServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /peer/v1/join", p.join)
 	mux.HandleFunc("GET /peer/v1/ping", p.auth(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "name": p.Group.Self})
+		writeJSON(w, 200, map[string]any{"ok": true, "name": p.Group.Self, "protocol": group.Protocol})
+	}))
+	mux.HandleFunc("GET /peer/v1/version", p.auth(func(w http.ResponseWriter, r *http.Request) {
+		un, _ := p.Ctl.St.UnfinishedDeploys()
+		writeJSON(w, 200, VersionInfo{Name: p.Group.Self, Version: p.Ctl.Version, Protocol: group.Protocol, Busy: len(un) > 0})
 	}))
 	mux.HandleFunc("PUT /peer/v1/group", p.auth(p.putGroup))
 	mux.HandleFunc("POST /peer/v1/image", p.auth(p.image))
@@ -219,20 +223,50 @@ func (c *PeerClient) SendImage(ctx context.Context, srv group.Server, app string
 	return nil
 }
 
-func (c *PeerClient) Ping(ctx context.Context, srv group.Server) error {
+func (c *PeerClient) Ping(ctx context.Context, srv group.Server) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, "/peer/v1/ping"), nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	resp, err := c.Group.Client(0).Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return readError(resp)
+		return 0, readError(resp)
 	}
-	return nil
+	var out struct {
+		Protocol int `json:"protocol"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Protocol, nil
+}
+
+// VersionInfo is what a server says about the agent it runs.
+type VersionInfo struct {
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	Protocol int    `json:"protocol"`
+	Busy     bool   `json:"busy"` // it has deploys in progress
+}
+
+// Version asks a server which agent version it runs and whether it is busy.
+func (c *PeerClient) Version(ctx context.Context, srv group.Server) (VersionInfo, error) {
+	var v VersionInfo
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, "/peer/v1/version"), nil)
+	if err != nil {
+		return v, err
+	}
+	resp, err := c.Group.Client(10 * time.Second).Do(req)
+	if err != nil {
+		return v, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return v, readError(resp)
+	}
+	return v, json.NewDecoder(resp.Body).Decode(&v)
 }
 
 func (c *PeerClient) Announce(ctx context.Context, srv group.Server, f store.Final) error {

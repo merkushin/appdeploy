@@ -32,6 +32,8 @@ type Server struct {
 
 	// SelfUpdate installs the latest signed release; set by the agent. AfterUpdate
 	// is called after a successful install, to restart the agent.
+	Version string // the version of this agent
+
 	SelfUpdate  func(ctx context.Context, check, force bool, repo string, log func(string)) (update.Result, error)
 	AfterUpdate func()
 
@@ -93,6 +95,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/apps/{app}/db/restore", s.dbRestore)
 	mux.HandleFunc("GET /v1/apps/{app}/export", s.export)
 	mux.HandleFunc("POST /v1/self-update", s.selfUpdate)
+	mux.HandleFunc("POST /v1/group/version", s.groupSetVersion)
+	mux.HandleFunc("GET /v1/group/versions", s.groupVersions)
 	mux.HandleFunc("GET /v1/group", s.groupInfo)
 	mux.HandleFunc("POST /v1/group/invite", s.groupInvite)
 	mux.HandleFunc("DELETE /v1/group/servers/{name}", s.groupRemove)
@@ -789,4 +793,81 @@ func (s *Server) selfUpdate(w http.ResponseWriter, r *http.Request) {
 	if err == nil && res.Updated && s.AfterUpdate != nil {
 		s.AfterUpdate()
 	}
+}
+
+// ---- group versions ----
+
+func (s *Server) groupSetVersion(w http.ResponseWriter, r *http.Request) {
+	if s.Group == nil || !s.Group.IsFounder() {
+		writeErr(w, errors.New("only the server that created the group can set the version it runs"))
+		return
+	}
+	var req struct {
+		Version string `json:"version"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, err)
+		return
+	}
+	v := strings.TrimSpace(req.Version)
+	if v != "" {
+		if _, ok := update.ParseVersion(v); !ok {
+			writeErr(w, fmt.Errorf("%q is not a version like v1.2.3", v))
+			return
+		}
+		v = "v" + strings.TrimPrefix(v, "v")
+	}
+	st, err := s.Group.SetDesiredVersion(v)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if s.Peer != nil {
+		go s.Peer.Broadcast(context.Background(), st)
+	}
+	writeJSON(w, 200, st)
+}
+
+// ServerVersion is one row of `group versions`.
+type ServerVersion struct {
+	Name      string   `json:"name"`
+	Addr      string   `json:"addr"`
+	Labels    []string `json:"labels"`
+	Version   string   `json:"version"`
+	Reachable bool     `json:"reachable"`
+	Busy      bool     `json:"busy"`
+	Error     string   `json:"error,omitempty"`
+}
+
+type GroupVersions struct {
+	Desired string          `json:"desired"`
+	Servers []ServerVersion `json:"servers"`
+}
+
+func (s *Server) groupVersions(w http.ResponseWriter, r *http.Request) {
+	if s.Group == nil {
+		writeErr(w, errors.New("this server is not in a group"))
+		return
+	}
+	st := s.Group.State()
+	out := GroupVersions{Desired: st.DesiredVersion}
+	pc := &PeerClient{Group: s.Group}
+	for _, srv := range st.Servers {
+		row := ServerVersion{Name: srv.Name, Addr: srv.Addr, Labels: srv.Labels}
+		if srv.Name == s.Group.Self {
+			un, _ := s.St.UnfinishedDeploys()
+			row.Version, row.Reachable, row.Busy = s.Version, true, len(un) > 0
+		} else {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			v, err := pc.Version(ctx, srv)
+			cancel()
+			if err != nil {
+				row.Error = err.Error()
+			} else {
+				row.Version, row.Reachable, row.Busy = v.Version, true, v.Busy
+			}
+		}
+		out.Servers = append(out.Servers, row)
+	}
+	writeJSON(w, 200, out)
 }

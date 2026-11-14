@@ -322,3 +322,15 @@ func (c *Client) Export(ctx context.Context, app, format string) (map[string]str
 	err := c.call(ctx, "GET", "/v1/apps/"+app+"/export?format="+format, nil, &out)
 	return out.Files, err
 }
+
+// GroupSetVersion makes version (empty to clear) the release every server should run.
+func (c *Client) GroupSetVersion(ctx context.Context, version string) error {
+	return c.call(ctx, "POST", "/v1/group/version", map[string]any{"version": version}, nil)
+}
+
+// GroupVersions lists the agent version each server runs, next to the desired one.
+func (c *Client) GroupVersions(ctx context.Context) (GroupVersions, error) {
+	var out GroupVersions
+	err := c.call(ctx, "GET", "/v1/group/versions", nil, &out)
+	return out, err
+}
