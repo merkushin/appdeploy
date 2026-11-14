@@ -827,6 +827,12 @@ coordinator of a deploy refuses to roll out to a server that reports another one
 API is not backward compatible; while it is the same, differing versions interoperate
 (unknown JSON fields are ignored).
 
+**Group view sync.** A change of members or of the wanted version is broadcast when it is
+made, and every server also asks its peers for their view every 30 seconds and adopts the
+highest version (`GET /peer/v1/group`), so a server that was down at that moment catches up.
+`deploy --image` accepts `--config -` to read the `appdeploy.yml` from standard input, which is
+how it travels from CI over `--host` (a file name is read where the command runs).
+
 **Not done:** updating automatically to new patch releases (it is always an explicit
 `set-version`), the install script downloading the latest release itself (it still takes
 `--binary`), a release channel other than the one named, `--check` notifications, and
