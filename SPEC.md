@@ -494,7 +494,7 @@ services and backups; webhook notifications; disk cleanup.
 `join`, mTLS, labels and roles; image distribution; waves and canary; `--resume`;
 catching-up servers; health endpoint for external load balancers; `builder` server.
 
-**M4 — exit and convenience** (export, `--image` and access roles implemented, see §26)
+**M4 — exit and convenience** (all but the migration linter implemented, see §26 and §27)
 `export` to all formats; `--image` from CI; `self-update`; access roles; migration linter.
 
 ### M1 acceptance criteria
@@ -742,6 +742,50 @@ deployed are skipped), and `disk.low` when free space on the data disk falls bel
 build thresholds (5 GiB or 10%), once until it recovers by 20%. Both go to the global
 webhooks and to the app's `notify:` list.
 
-**Not done:** `self-update` (needs a place to publish signed releases), the migration
-linter, uploading backups to S3-compatible storage, a cgroup memory limit for builds, and
+**Not done:** the migration linter, uploading backups to S3-compatible storage, a cgroup memory limit for builds, and
 services for apps whose roles run on several servers.
+
+## 27. Releases and self-update
+
+Releases are published on GitHub (`merkushin/appdeploy`, public, so servers need no token).
+Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml` on a Linux runner:
+`go vet`, `go test`, then `scripts/release.sh`, which cross-compiles
+`appdeploy-<os>-<arch>` for linux and darwin on amd64 and arm64, writes `SHA256SUMS`, signs
+it with ed25519 (`SHA256SUMS.sig`, base64) and verifies the signature before anything is
+published. The binaries are built with the matching public key and the repository
+(`-X main.updatePublicKey`, `-X main.updateRepo`, `-X main.version`).
+
+**One-time setup, by the owner of the repository.**
+`go run ./cmd/releasetool keygen -out release.key` writes the private key (mode 0600,
+never overwrites) and prints the public key. Store the private key as the repository
+secret `RELEASE_SIGNING_KEY` and keep a backup; store the public key as the repository
+variable `RELEASE_PUBLIC_KEY`. `.gitignore` excludes `*.key` and `dist/`.
+
+**Updating.** `appdeploy self-update [--check] [--force] [--repo owner/name]` (admin; over
+SSH as `appdeploy --host deploy@server self-update`) asks the agent, which runs as root:
+
+1. fetch the latest release from the GitHub API;
+2. refuse unless it is newer than the running version (a `dev` build takes any release;
+   `--force` allows the same or an older one);
+3. download `SHA256SUMS`, `SHA256SUMS.sig` and the binary for this OS and CPU, verify the
+   signature against the key built into the running binary, then the binary's hash;
+4. write the binary next to the current one, run it with `version` and require it to report
+   the release's version;
+5. keep the old binary as `appdeploy.previous` and rename the new one into place;
+6. reply, then exit cleanly a second later so that systemd (`Restart=always`) starts the new
+   binary. Containers keep running, and unfinished deploys resume.
+
+Without `--force` it refuses while deploys are in progress. A binary built without a
+public key (a plain `go build`) cannot verify updates and says so. To go back by hand:
+`mv appdeploy.previous appdeploy` and restart the service.
+
+**Trust.** The signature, not GitHub's TLS, is what is trusted: someone who gets into the
+GitHub account cannot ship code to servers unless they also have the signing key. The risk
+that remains is theft of the key, which lives in the repository's Actions secrets; a
+protected environment with required reviewers for that secret narrows it further. There is
+no key rotation: a new key means a release of binaries that embed it, which servers accept
+only if it is still signed with the old key, and that migration is not automated.
+
+**Not done:** updating a whole group from one command (run it on each server), the install
+script downloading the latest release itself (it still takes `--binary`), a release
+channel other than "latest", and `--check` notifications.

@@ -51,6 +51,14 @@ appdeploy export <app> --format kamal|compose|k8s|fly   leave: the same setup fo
 appdeploy domains set <app> <domain>...
 ```
 
+## Releases and updates
+
+A tag `vX.Y.Z` builds, signs and publishes binaries on GitHub (SPEC.md §27). Servers update
+themselves: `appdeploy --host deploy@server self-update` installs the latest release if
+its signature matches the key built into the running binary; the agent restarts into it and
+keeps the apps running. Setting up the signing key is a one-time step described in
+`.github/workflows/release.yml`.
+
 ## Development
 
 ```bash
