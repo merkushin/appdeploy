@@ -163,7 +163,7 @@ roles:
     on: [web]                  # server labels; defaults to [web]
     port: 8080                 # defaults to the Dockerfile EXPOSE, otherwise 8080;
                                # also passed to the app as the PORT env var
-    cmd: null                  # defaults to the image CMD
+    cmd: null                  # replaces the image CMD; the ENTRYPOINT is kept
     memory: 512M
     cpus: 1
     replicas_per_server: 1
@@ -172,10 +172,10 @@ roles:
     stop_timeout: 30s
   worker:
     on: [web]
-    cmd: /app/server worker
+    cmd: worker                # passed to the image ENTRYPOINT, e.g. "/server worker"
     memory: 512M
 
-release_command: null          # e.g. "/app/server migrate up" (§9)
+release_command: null          # like cmd: replaces the image CMD, e.g. "migrate up" (§9)
 
 services:
   postgres: true               # injects DATABASE_URL
@@ -228,6 +228,9 @@ Error branches:
 
 - `git push` to the app's branch (the main path). Deploy output is streamed to the git
   client as `remote: …` lines. A dropped connection **does not abort** the deploy.
+  Note: git ignores the exit status of a `post-receive` hook, so `git push` exits 0
+  even when the deploy failed; the failure is only visible in the `remote:` lines.
+  Scripts and CI should use `appdeploy deploy`, which exits non-zero on failure.
 - `appdeploy deploy shop --ref <sha>` — redeploy or ship a specific commit.
 - `appdeploy deploy shop --image <ref>` — a prebuilt image from CI (the build is skipped).
 - `appdeploy config set` / `secrets set` — a new release without a rebuild.
@@ -244,8 +247,11 @@ Error branches:
 
 1. The new container is running and has passed `verifying`.
 2. The agent atomically changes the upstream in Caddy (one admin API call).
-3. The old container gets SIGTERM, has `stop_timeout` to finish in-flight requests, then
-   is removed (the image is kept).
+3. The old container keeps running while the new release is observed (§8), so a rollback
+   is only a proxy switch. When the observation window ends, the old container gets
+   SIGTERM, has `stop_timeout` to finish in-flight requests, then is removed (the image
+   is kept). Without a previous release, or for a manual rollback, there is nothing to
+   observe against and the old containers are retired at once.
 
 Non-web roles: new containers start, then the old ones get SIGTERM with `stop_timeout`.
 A short overlap of two worker versions is allowed; jobs must be idempotent.
@@ -278,9 +284,12 @@ Rules:
 
 - The new schema must work with the **old** code (expand/contract). The old release serves
   traffic during and after the migration and serves it again after a rollback.
-- **Compatibility check:** during `migrating` and `starting`, the watchdog watches the
-  **old** release. If its 5xx rate rises after the migration, the deploy stops before the
-  switch and an alert is sent: the schema is probably incompatible with the old code.
+- **Compatibility check:** after the release command ran, the agent watches the **old**
+  release (still serving traffic) until the new one has passed `verifying`. If its 5xx
+  rate rose above the watchdog limit, it logs `migration.suspect` and sends the webhook.
+  It does **not** stop the deploy: the migration is already applied and cannot be undone,
+  so the old code is already broken and the fastest fix is for the new code to take over
+  (where the watchdog then watches it). The warning tells a human why.
 - There are no automatic down-migrations. Rolling back a release restores the code, not
   the schema.
 - If `release_command` fails, the deploy goes to `failed`. Postgres DDL is transactional,
@@ -462,23 +471,25 @@ feature that cannot be exported is a reason not to build it.
 2. **Docker or Podman** (rootless, daemonless).
 3. **Cron jobs:** a role with supercronic inside the image (as today) or `schedule:` in
    the config, run by the agent.
-4. **Traffic metrics for the watchdog:** from Caddy access logs or its Prometheus metrics.
+4. ~~Traffic metrics for the watchdog~~ — decided: Caddy's JSON access log, written to a
+   file the agent follows (`--access-log`). It needs no metrics configuration and survives
+   agent restarts; the agent keeps per-host counters in memory.
 5. **Private network between servers** for Postgres: rely on the provider's network or run
    WireGuard.
 6. **Name.**
 
 ## 21. Milestones
 
-**M1 — one server, several apps**
-`init` installation; `git push` → build → start → healthcheck → switch; Caddy + TLS;
-secrets; resource and build limits; deploy queue; journal and resume after an agent
-crash; `rollback`, `status`, `logs`, `exec`.
+**M1 — one server, several apps** (implemented, see §23)
+install script; `git push` → build → start → healthcheck → switch; Caddy + TLS;
+secrets; memory limits and serialized builds; deploy queue; journal and resume after an
+agent crash; `rollback`, `status`, `logs`, `exec`; `release_command`.
 
-**M2 — reliability**
-watchdog with automatic rollback; `release_command` and the migration compatibility
-check; Postgres/Redis services and backups; webhook notifications; disk cleanup.
+**M2 — reliability** (implemented, S3 upload excepted, see §24)
+watchdog with automatic rollback; the migration compatibility check; Postgres/Redis
+services and backups; webhook notifications; disk cleanup.
 
-**M3 — multiple servers**
+**M3 — multiple servers** (implemented except `builder` servers and catching-up, see §25)
 `join`, mTLS, labels and roles; image distribution; waves and canary; `--resume`;
 catching-up servers; health endpoint for external load balancers; `builder` server.
 
@@ -509,3 +520,159 @@ have no runtime dependencies and let each test exercise exactly one behavior:
 
 The apps are framework-free so that nothing in appdeploy depends on a particular
 language; a Rails example may be added later only as a compatibility check.
+
+## 23. M1 implementation status
+
+M1 is implemented in this repository. What exists, and where it differs from the text
+above:
+
+**Works and is covered by tests** (`go test ./...`; `go test -tags e2e ./e2e` runs the real
+agent against Docker and a Caddy container with the apps in `examples/`):
+
+- zero-config deploy by `git push`; update with no failed request (hundreds of requests
+  during the switch, none failed); failed deploys leave the live release untouched and
+  clean up their containers, image and release row;
+- crashing, unhealthy and never-listening apps are rejected, even on the first deploy;
+- rollback, secrets (new release without a rebuild; rollback restores the old secrets),
+  `release_command`, extra roles (`worker`), `logs`, `exec`, domains;
+- several apps on one server, with memory limits checked against RAM;
+- queue: pending deploys collapse to the latest one;
+- `git push` killed mid-deploy does not stop the deploy;
+- `kill -9` of the agent mid-build resumes the same deploy after restart;
+- `kill -9` of the agent at each step of the traffic switch (before the store changes,
+  after, after the proxy changes) is completed after restart; traffic keeps flowing;
+- the SSH entry point (`appdeploy shell`) accepts only `git-receive-pack`/`git-upload-pack`
+  of an existing app and client commands, and refuses everything else.
+
+**Differences from the spec above**
+
+- `release_command` is in M1 (it was planned for M2).
+- Builds are serialized (one at a time per server) but not yet confined to a cgroup with
+  a memory limit (§11); a heavy build can still starve neighbors.
+- Port 8080 is the default web port, passed to the app as `PORT`.
+- `cmd` and `release_command` replace the image's CMD (the ENTRYPOINT stays).
+- Containers publish their port on `127.0.0.1` (random host port); Caddy proxies to it.
+  The agent flag `--upstream-host` changes the host the proxy dials (the tests run Caddy
+  in a container and use `host.docker.internal`).
+- Release numbers come from a counter shared with deploys, so a failed deploy burns its
+  number (`v1`, then `v3` after a failed `v2`).
+- Every SSH key in `authorized_keys` is an admin (roles are M4). `secrets export` and
+  `exec` are therefore available to every deployer.
+- `scripts/install.sh` has only been syntax-checked, not run on a real Linux server.
+
+## 24. M2 implementation status
+
+**Watchdog (§8), covered by e2e tests.** After the switch the deploy enters `observing`
+for `watch.window` (default 3m, so an update takes that long to report `succeeded`; the
+client may disconnect, and `watch.window` can be shortened). The previous release stays
+up. The new release is rolled back (traffic back to the previous release, new containers,
+row and image removed, state `rolled_back`) when, within the window:
+
+- the 5xx rate exceeds `max(watch.error_rate, 2 x the rate over the minute before the
+  switch)` with at least `watch.min_requests` requests (counted from Caddy's access log);
+- or a container restarted `watch.max_restarts` times, or exited;
+- or the web health check fails 3 times in a row.
+
+Without `--access-log` only the last two apply. A first deploy has nothing to roll back
+to and completes immediately. p95 latency is not watched (the spec makes it warn-only).
+A crash of the agent during the switch or during observation is resumed (the observation
+window restarts).
+
+**Notifications (§17).** `notify:` URLs in `appdeploy.yml` and the agent's repeatable
+`--notify-url` get `deploy.started`, `deploy.succeeded`, `deploy.failed`,
+`deploy.rolled_back` and `migration.suspect` as JSON. Slack incoming webhooks and the
+Telegram Bot API get `{"text": ...}`. Delivery is asynchronous with 2 retries; 4xx
+answers are not retried; webhook URLs are never written to logs (they carry secrets).
+`app.crashed`, `disk.low` and `backup.failed` are not implemented.
+
+**Disk cleanup (§11).** After a successful deploy (and only while no build runs) dangling
+images of this agent's builds are pruned. `--prune-build-cache 168h` additionally drops
+build cache unused for that long; it is off by default because the cache is shared with
+everything else on that Docker. Release images beyond `keep_releases` were already
+pruned in M1. Log rotation of containers (3 x 20 MB) and of Caddy's access log (20 MB x 3)
+is configured.
+
+**Migration compatibility check (§9)** warns instead of stopping, see §9. Only the
+decision function is unit-tested; there is no e2e test for it.
+
+**Services and backups (§12), covered by an e2e test.** `services: {postgres: true,
+redis: true}` starts one shared `postgres:17-alpine` and/or `redis:7-alpine` container per
+agent (named volumes, memory-limited, restarted by Docker) and puts `DATABASE_URL` /
+`REDIS_URL` into the release's environment. Each app gets its own Postgres role and
+database (`app_<name>`), with a random password kept in `/var/lib/appdeploy/services/`
+(0600) and reused on every deploy. The service container is attached to the app's own
+network, so apps cannot reach each other's containers. A secret with the same name
+(`DATABASE_URL`) overrides the generated one, which is how an app points at an external
+database. Redis gives each app its own database number (1-15, so at most 15 apps); that
+separates keys but is not a security boundary, since all apps share the server password,
+and the URL uses the user name `default` because `redis-cli` rejects an empty one.
+
+`appdeploy db backup|list|restore <app>`: `pg_dump --clean --if-exists` to
+`/var/lib/appdeploy/backups/<app>/<UTC time>.sql.gz`. The agent backs up every app with
+Postgres every `--backup-every` (default 24h; 0 disables) and keeps the newest backup of
+each of the last 7 days plus of each of the last 4 weeks. A failed scheduled backup sends
+`backup.failed`. Restoring replaces the database's tables with the dump's.
+
+Gaps: no S3-compatible upload (backups live on the server's disk, so a lost server loses
+them: copy `/var/lib/appdeploy/backups` elsewhere), no Postgres replication, service
+containers are not counted in the memory check, `apps destroy` keeps the app's database
+and role, services are reachable only from this server (a private network for multi-server
+groups is M3), service images are not upgraded by appdeploy, and `app.crashed` and
+`disk.low` notifications are not implemented.
+
+**Testing hooks.** `APPDEPLOY_FAILPOINT=switch:before|switch:after-db|switch:after-proxy|observe:start`
+makes the agent SIGKILL itself at that point of the traffic switch or observation. It exists only so the
+e2e tests can crash the agent at exact moments.
+
+## 25. M3 implementation status
+
+**Groups, covered by unit and e2e tests (three servers sharing one Docker daemon).**
+
+- `appdeploy group init --server a --advertise host:7070 --labels web,db` on the first
+  server creates a private CA (ECDSA P-256) and a certificate for the server; the agent
+  then also listens on the peer port (TLS 1.3, client certificates required).
+  `appdeploy group invite` (on the founder) prints a one-hour, single-use token holding
+  the founder's address, the CA fingerprint and a secret. On the new server
+  `appdeploy group join --token ... --server b --advertise ... --labels web` pins that
+  fingerprint, sends a certificate request and receives its certificate. Run `join` before
+  starting the agent of the new server.
+- Membership is a versioned list replicated to every member; the higher version wins and
+  only the founder changes it (`group servers`, `group remove`). Consequently the founder
+  is a single point for adding or removing servers (not for deploying) and its CA key is
+  the group's root of trust; there is no CA rotation or certificate renewal (certificates
+  last 5 years).
+- A deploy is coordinated by the server that received the push or command. It builds once,
+  runs `release_command` once, sends the image (`docker save | gzip`) to every other
+  target in parallel, then rolls out in waves: up to 3 targets one at a time, otherwise a
+  canary and then 25% at a time. A server is a target if its labels intersect any role's
+  `on:`; each runs only the roles that match. The coordinator may also be a target.
+  Each server runs the usual steps (start, verify, switch, observe) and reports through
+  its journal, which the coordinator copies into its own as `[server] ...` lines. The
+  canary is observed for at most 1 minute, later waves for at most 20 seconds (or
+  `watch.window`, if shorter) — the full window applies to single-server deploys.
+- If a wave fails, the servers that already switched go back (to their previous release,
+  or are cleared if it was their first) and the coordinator's deploy fails with
+  `rollout stopped in wave N`. `appdeploy rollback` goes back on every server.
+- Requests are idempotent per release number: asking a server again for a release it
+  already serves does nothing. If the coordinator dies mid-rollout, its restart runs the
+  deploy again from the start (the build is mostly cached) and the servers that finished
+  answer "already serving"; this stands in for `deploy --resume`.
+- `appdeploy` containers get `APPDEPLOY_SERVER` (the server's name) in their environment.
+- `--health-listen :7071` serves `GET /health/<app>`: 200 when the server runs a web
+  container of the live release, 503 otherwise, with no authentication. It does not yet
+  report 503 during `switching`.
+- `--network-pool CIDR` makes the agent allocate /24 subnets for app networks from that
+  pool; Docker's default pool holds about 30 networks, so about 15 apps. The install
+  script configures Docker with 172.80.0.0/12 split into /24s.
+
+**Not done:** a `builder` label for dedicated build servers; `--allow-partial` and servers
+catching up after downtime (a server that was down misses the rollout and only gets the
+next one); Caddy on each server routes only to its own containers, so spreading traffic
+across servers needs an external balancer (use the health endpoint); services
+(Postgres/Redis) are refused when a role runs on a server other than the coordinator
+(they would not be reachable), so use an external `DATABASE_URL` secret; secrets are sent
+to servers inside each release's payload over mutual TLS, not replicated on their own,
+and apps are created on the other servers by their first deploy; access to the peer API
+is all-or-nothing for any member; the git repository of an app lives only on the server
+that was pushed to, so push to the same server each time (a different server needs its own
+`apps create`).
