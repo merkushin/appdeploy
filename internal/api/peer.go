@@ -46,6 +46,9 @@ func (p *PeerServer) Handler() http.Handler {
 		writeJSON(w, 200, VersionInfo{Name: p.Group.Self, Version: p.Ctl.Version, Protocol: group.Protocol, Busy: len(un) > 0})
 	}))
 	mux.HandleFunc("PUT /peer/v1/group", p.auth(p.putGroup))
+	mux.HandleFunc("GET /peer/v1/group", p.auth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, p.Group.State())
+	}))
 	mux.HandleFunc("POST /peer/v1/image", p.auth(p.image))
 	mux.HandleFunc("GET /peer/v1/image", p.auth(p.fetchImage))
 	mux.HandleFunc("GET /peer/v1/finals", p.auth(func(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +244,43 @@ func (c *PeerClient) Ping(ctx context.Context, srv group.Server) (int, error) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out.Protocol, nil
+}
+
+// GroupState asks a server for its view of the group.
+func (c *PeerClient) GroupState(ctx context.Context, srv group.Server) (group.State, error) {
+	var st group.State
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(srv, "/peer/v1/group"), nil)
+	if err != nil {
+		return st, err
+	}
+	resp, err := c.Group.Client(10 * time.Second).Do(req)
+	if err != nil {
+		return st, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return st, readError(resp)
+	}
+	return st, json.NewDecoder(resp.Body).Decode(&st)
+}
+
+// SyncGroup adopts the newest membership and wanted version any peer knows. A
+// change is broadcast when it is made; this is how a server that was down at the
+// time gets it. It reports whether anything changed.
+func (c *PeerClient) SyncGroup(ctx context.Context) bool {
+	changed := false
+	for _, p := range c.Group.Peers() {
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		st, err := c.GroupState(pctx, p)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if ok, err := c.Group.Apply(st); err == nil && ok {
+			changed = true
+		}
+	}
+	return changed
 }
 
 // VersionInfo is what a server says about the agent it runs.

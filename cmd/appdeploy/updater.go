@@ -123,6 +123,24 @@ func (u *updater) runLoop(ctx context.Context, every time.Duration, g *group.Gro
 	}
 }
 
+// runGroupSync keeps this server's view of the group (members, wanted version)
+// current even if it missed the broadcast of a change.
+func runGroupSync(ctx context.Context, every time.Duration, pc *api.PeerClient) {
+	t := time.NewTimer(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if pc.SyncGroup(ctx) {
+			log.Printf("group: adopted a newer view of the group from a peer")
+		}
+		t.Reset(every)
+	}
+}
+
 // confirmAfter clears the update marker once this agent has run healthily for a
 // while; until then a failing new version can still be reverted.
 func confirmAfter(ctx context.Context, d time.Duration, dataDir string, c *api.Client) {

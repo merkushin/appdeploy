@@ -193,6 +193,7 @@ func runAgent(args []string) int {
 	}
 	if grp != nil {
 		go eng.RunCatchUp(ctx, 30*time.Second)
+		go runGroupSync(ctx, 30*time.Second, &api.PeerClient{Group: grp})
 		if *updateEvery > 0 {
 			go upd.runLoop(ctx, *updateEvery, grp, st, &api.PeerClient{Group: grp}, stop)
 		}

@@ -603,3 +603,25 @@ func TestGroupRollingUpdate(t *testing.T) {
 		t.Errorf("clearing the version: %v %s", err, out)
 	}
 }
+
+// A server that was down when the wanted version was set learns it from its peers.
+func TestGroupViewSyncsToAServerThatWasDown(t *testing.T) {
+	g := needGroup(t)
+	g.c.stop(syscall.SIGKILL)
+	// An older version than the servers run, so nobody tries to install anything.
+	if out, err := g.a.cli("group", "set-version", "v0.0.1"); err != nil {
+		t.Fatalf("set-version: %v\n%s", err, out)
+	}
+	g.c.start(t)
+	waitFor(t, 60*time.Second, "c to learn the wanted version from its peers", func() bool {
+		gv, err := g.c.client.GroupVersions(context.Background())
+		return err == nil && gv.Desired == "v0.0.1"
+	})
+	if out, err := g.a.cli("group", "set-version", "none"); err != nil {
+		t.Errorf("clearing: %v %s", err, out)
+	}
+	waitFor(t, 60*time.Second, "the cleared version to reach c", func() bool {
+		gv, err := g.c.client.GroupVersions(context.Background())
+		return err == nil && gv.Desired == ""
+	})
+}
