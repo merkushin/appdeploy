@@ -1,0 +1,1864 @@
+# appdeploy: full documentation
+
+Generated from README.md and docs/*.md; do not edit. The index is llms.txt.
+
+---
+
+<!-- file: README.md -->
+
+# appdeploy
+
+Deploy web apps to your own servers with `git push`. A small agent on each server builds your
+Dockerfile, starts the new version next to the old one, checks it, switches traffic, watches
+the real traffic for a few minutes, and **rolls back by itself** if the new version misbehaves.
+It keeps going when your laptop disconnects, and picks up where it left off if the agent
+itself restarts.
+
+```bash
+git remote add prod deploy@my-server:myapp
+git push prod main
+```
+
+```
+remote: ==> validating
+remote: ==> building
+remote: ==> starting
+remote: ==> verifying
+remote: myapp-v2-web-1: healthcheck GET /up ok
+remote: ==> switching
+remote: ==> observing
+remote: ==> succeeded: myapp is now serving v2
+```
+
+> **Status: early (v0.1).** The core is covered by an end-to-end test suite that runs real
+> Docker and Caddy, but appdeploy has not been used in production yet and the install script
+> has not been run on a real Linux server. Read [what it does not do](docs/comparison.md#what-appdeploy-does-not-do)
+> before you choose it.
+
+## Why appdeploy
+
+- **The server drives the deploy, not your laptop.** Close the lid, lose Wi-Fi, kill `git push`:
+  the deploy finishes anyway. If the agent crashes mid-switch, it finishes or reverts on restart.
+- **Rollback by real traffic, not just a health check.** After the switch the old version stays
+  up while the new one is watched. Too many 5xx, crash loops or failing health checks put
+  traffic back on the old version in one proxy switch.
+- **No registry, no cross-building.** Images are built on the server (or on a build server)
+  and sent between your servers directly.
+- **Small groups without Kubernetes.** 1 to about 10 servers: roles placed by labels, canary
+  first, a failed rollout is undone, a server that was down catches up by itself.
+- **Easy to leave.** `appdeploy export` writes the same setup for Kamal, Docker Compose,
+  Kubernetes or Fly. Your app only needs a Dockerfile, environment variables and `GET /up`.
+- **Batteries for small apps:** Postgres and Redis per app with daily backups, secrets per
+  release, webhooks (Slack, Telegram, generic), signed self-update, SSH roles.
+
+How it compares to Kamal, Dokku, Coolify and others: [docs/comparison.md](docs/comparison.md).
+
+## Documentation
+
+| | |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install on a server, deploy your first app |
+| [Concepts](docs/concepts.md) | How a deploy works, what a release is, what the watchdog does |
+| [Commands](docs/commands.md) | Every command of the CLI |
+| [Configuration](docs/configuration.md) | `appdeploy.yml`, agent flags, files on disk |
+| [Server groups](docs/groups.md) | Several servers, labels, build servers, updating a group |
+| [Operations](docs/operations.md) | Backups, secrets, updates, security, monitoring |
+| [Troubleshooting](docs/troubleshooting.md) | Error messages and what to do |
+| [Migration](docs/migration.md) | From Kamal, Compose, Dokku, Fly, and away from appdeploy |
+| [Comparison](docs/comparison.md) | When to choose appdeploy and when not to |
+| [HTTP API](docs/api.md) | The agent's JSON API |
+| [Guide for AI assistants](docs/llm-guide.md) | Rules for LLMs and agents operating appdeploy ([llms.txt](llms.txt)) |
+| [Design](SPEC.md) | The design document and what is implemented |
+
+## Quick start
+
+On a Debian or Ubuntu server with systemd, as root, with the binary and `install.sh` of one
+[release](https://github.com/merkushin/appdeploy/releases) (download steps in
+[Getting started](docs/getting-started.md#1-get-the-binary-and-the-install-script)):
+
+```bash
+./install.sh --binary ./appdeploy-linux-amd64 --ssh-key-file ./my-key.pub
+```
+
+On your computer, with the `appdeploy` binary from the same release:
+
+```bash
+appdeploy --host deploy@my-server apps create myapp --domain myapp.example.com
+git remote add prod deploy@my-server:myapp
+git push prod main
+```
+
+The full walkthrough, including DNS and what your app must provide, is in
+[Getting started](docs/getting-started.md).
+
+## Development
+
+```bash
+go test ./...                              # unit tests
+go test -tags e2e -timeout 40m ./e2e       # end-to-end: needs Docker; pulls golang:1.27-alpine, caddy:2, postgres and redis
+```
+
+The end-to-end tests start their own agent and Caddy, deploy the Go apps in `examples/`, and
+remove every container, image, network, volume and directory they create. Set `E2E_KEEP=1`
+to keep the temp directory (with `agent.log`) when debugging. The documentation is checked
+against the code by `go test ./internal/docs` (commands, configuration keys, agent flags, API
+routes, links, examples and the error messages the docs quote); if you change `README.md` or
+`docs/`, regenerate `llms-full.txt` with `UPDATE_DOCS=1 go test ./internal/docs`. Releases are described in
+[SPEC.md §27](SPEC.md).
+
+---
+
+<!-- file: docs/llm-guide.md -->
+
+# Guide for AI assistants and agents
+
+For an LLM or an autonomous agent that operates appdeploy on behalf of a person. It is written
+to be followed literally. It describes version 0.1.x; if a command here disagrees with
+`appdeploy help` on the machine you are on, trust `appdeploy help` and say so.
+
+Files for ingestion: [`llms.txt`](../llms.txt) (an index) and
+[`llms-full.txt`](../llms-full.txt) (all the documentation in one file).
+
+## What appdeploy is, in six facts
+
+1. appdeploy deploys **Docker-based web apps** to Linux servers with `git push` or `appdeploy deploy`.
+   A deploy is run **by an agent on the server**, not by your terminal.
+2. An app is a git repository with a **Dockerfile**. Its settings are an optional `appdeploy.yml`.
+3. A deploy builds a **release** (`v1`, `v2`, ...). The old release keeps serving until the new
+   one is verified, and for a few minutes after the switch. A failed deploy changes nothing for
+   users. The system may **roll back by itself** (`rolled_back`): that is it working, not a bug.
+4. **Secrets** are environment variables stored on the server. Releases freeze their secrets.
+5. Containers are **stateless** (no volumes). Data lives in Postgres/Redis or elsewhere.
+6. The CLI is `appdeploy`. From a workstation: `appdeploy --host deploy@SERVER <command>`. On the
+   server itself: `appdeploy <command>` (needs root or the socket group).
+
+## Rules
+
+Follow these in order of importance.
+
+1. **Look before you change.** Run `appdeploy --host H status APP` first and say what you saw.
+   Never assume an app, a release number or a server exists.
+2. **Never judge a deploy by the exit status of `git push`.** It is 0 even when the deploy failed.
+   A deploy succeeded only if the output contains `==> succeeded` or `appdeploy deploy` exited 0.
+   `deploy failed:` and `rolled back` mean it did not (for `failed`, the old release is still live).
+3. **Do not retry blindly.** Read the error line that starts with `deploy failed:` (or `watchdog:`),
+   fix the cause, then deploy again. Repeating an unchanged deploy repeats the failure and wastes a
+   release number.
+4. **Never reveal secrets.** Do not run `secrets export`, and do not run `exec` with commands that print the
+   environment (`env`, `printenv`, `cat /proc/*/environ`), unless the person asked for exactly that.
+   Use `secrets list` (names only). Never write secret values into files in a repository, logs or
+   your answers. Values passed to `secrets set` appear in the shell history: tell the person.
+5. **Ask the person first** for anything in the "ask first" rows below. State what will happen, to
+   which app and server, and whether it can be undone.
+6. **Be patient.** A deploy takes the build time plus a 3-minute watch window by default. Do not
+   interrupt it, and do not start a second deploy of the same app to "speed it up": it would only queue behind the
+   running one. Use `--detach` and poll `status` every 30 seconds or longer if you must not block.
+7. **Do not touch appdeploy's files or containers by hand.** No editing of `/var/lib/appdeploy`, no
+   `docker rm` or `docker stop` of containers named `ad-*`, no editing of Caddy's config. Use commands.
+8. **Do not invent options.** Only the commands in this documentation exist. If you need something
+   that is not here (volumes, buildpacks, an interactive shell), say it is not supported.
+9. **Check the docs for what you are not sure about,** and say when you were unsure.
+
+## Command safety
+
+"Role" is the lowest SSH role that may run it (viewer < deployer < admin).
+
+| Command | What it does | Undo | Ask first? | Role |
+|---|---|---|---|---|
+| `ping`, `version`, `status`, `apps list`, `releases`, `db list`, `group servers` | read only | n/a | no | viewer |
+| `logs APP [--role R] [--tail N]` | prints container logs (may contain personal data) | n/a | no | deployer |
+| `secrets list APP` | names of secrets | n/a | no | deployer |
+| `export APP --format F` | prints config for another tool (no secret values) | n/a | no | admin |
+| `self-update --check` | looks for a newer release | n/a | no | admin |
+| `deploy APP`, `deploy APP --ref SHA` | new release of the code; the old one serves until verified | `rollback` | **yes on production** | deployer |
+| `deploy APP --image REF` | same, from a prebuilt image | `rollback` | **yes on production** | deployer |
+| `redeploy APP` | new release of the same image | `rollback` | yes | deployer |
+| `rollback APP [--to N]` | puts an older release back live | `rollback` or `deploy` | **yes** | deployer |
+| `secrets set/unset APP ...` | new release with changed environment | `rollback` restores the old values | **yes** | admin |
+| `domains set APP ...` | replaces the domain list at once | set it again | **yes** | admin |
+| `apps create APP` | registers an app | `apps destroy` | yes | admin |
+| `exec APP -- CMD` | runs a command in the live container | depends on CMD | **yes** | admin |
+| `db backup APP` | writes a backup file | delete the file | no | admin |
+| `db restore APP NAME` | **replaces the database's tables** | only by restoring another backup | **always** | admin |
+| `apps destroy APP` | **removes the app, its images, releases and secrets** (the database is kept) | no | **always** | admin |
+| `secrets export APP` | **prints secret values** | n/a | **always, and say where the output goes** | admin |
+| `self-update`, `self-update --force` | replaces the binary and restarts the agent | the agent reverts a bad update by itself | **yes** | admin |
+| `group set-version V` | every server installs release V, one after another | set another version | **yes** | admin |
+| `group invite`, `group remove S` | adds or removes a server | re-invite | **yes** | admin |
+
+Commands that never make sense for you: `agent`, `hook`, `shell`, `recover`; they are run by the
+system.
+
+## Recipes
+
+Replace `H` with `deploy@SERVER`, `APP` with the app. After every change, run
+`appdeploy --host H status APP` and report the result.
+
+### Deploy a change
+
+1. `git status` and `git log -1`: confirm what will be deployed. Does the repository have a
+   `Dockerfile`? Does the app listen on `$PORT` and answer `GET /up`?
+2. `git push prod main` (remote `prod` = `deploy@SERVER:APP`). Success is the line `==> succeeded`.
+3. If it printed `deploy failed:` the old release is still live: read the message and the log lines
+   above it, fix, repeat. If `rolled back`: look at `watchdog:` for the reason.
+
+For scripts, push to a branch that does not deploy and use the exit status:
+`git push prod HEAD:refs/heads/ci && appdeploy --host H deploy APP --ref "$(git rev-parse HEAD)"`.
+
+### Roll back
+
+`appdeploy --host H releases APP` (what exists, which is current), then
+`appdeploy --host H rollback APP` (previous) or `rollback APP --to N`. Success is
+`==> succeeded: APP is now serving vN`. Remember that rolling back also restores that release's secrets.
+
+### Change a secret
+
+`appdeploy --host H secrets set APP NAME=value`. This creates a release without rebuilding. Tell the
+person that the value is in the command line. To change several, use `--no-deploy` on all but the
+last. Never print the value back.
+
+### Add a domain
+
+`appdeploy --host H domains set APP a.example.com b.example.com`. This **replaces** the list: include
+the existing domains (`status APP` shows them). DNS must already point at the server, or HTTPS will
+not work.
+
+### Add a worker or a database
+
+Edit `appdeploy.yml`, commit, deploy:
+
+```yaml appdeploy.yml
+roles:
+  web: {}
+  worker:
+    cmd: worker          # arguments to the image's ENTRYPOINT
+release_command: migrate
+services:
+  postgres: true         # provides DATABASE_URL
+```
+
+There is no dry run, but an invalid file fails in the `validating` step, before anything is built or
+changed, so it is safe to try. Unknown keys are errors: use only the keys in
+[Configuration](configuration.md).
+
+### Back up and restore a database
+
+`db backup APP` then `db list APP`. To restore, first **ask**, then take a fresh backup, then
+`db restore APP NAME`. Backups are on the server's disk only.
+
+### Run a one-off command
+
+`appdeploy --host H exec APP -- COMMAND ARGS`. There is no terminal: nothing interactive. The
+command has to exist in the image. Do not use it to read secrets.
+
+### Look at a problem
+
+1. `status APP`: is the container `running`? what did the last deploys end with?
+2. `logs APP --tail 100`.
+3. On the server: `systemctl status appdeployd appdeploy-caddy`, `journalctl -u appdeployd -n 100`.
+4. Match the message in [Troubleshooting](troubleshooting.md).
+
+### Update appdeploy
+
+`self-update --check`, tell the person, then `self-update`. For several servers: on the founder,
+`group set-version vX.Y.Z`, then watch `group servers`. A version that fails to start reverts itself.
+
+## Reading the output
+
+- A deploy prints `queued`, then lines starting with `==> ` that name the state (`validating`,
+  `building`, `migrating`, `starting`, `verifying`, `switching`, `observing`, `succeeded`). Failures print `deploy failed: REASON`. Under `git push` each line is prefixed `remote:`.
+- Exit status of `appdeploy`: 0 success; 1 failure (including a deploy that did not succeed); 2 wrong
+  usage. The exit status of `git push` is **not** a signal.
+- Terminal states of a deploy: `succeeded`, `failed` (old release still live), `rolled_back` (old
+  release live again), `superseded` (a newer deploy replaced a waiting one).
+- The text tables are for people and may change. For parsing, use the JSON API on the server:
+
+```bash
+curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/apps/APP | jq '.app.current_release, .containers, .deploys[0]'
+curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/deploys/DEPLOY_ID
+```
+
+  Fields and endpoints: [HTTP API](api.md). Wait for a deploy by reading
+  `GET /v1/deploys/ID/events` until a line with `"done":true`.
+
+## Things that look wrong but are normal
+
+- The first deploy of an app is quick and has no `observing`: there is no old release to compare.
+- Release numbers skip: a failed deploy uses its number (`v1`, then `v3`).
+- A deploy "hangs" for three minutes at `observing`: that is the watch window; traffic has already moved.
+- `git push` prints `remote: appdeploy: deploy failed: ...` and still exits 0.
+- After a successful deploy the previous container disappears; the release is kept for rollback.
+- `status` shows a container of two releases for a few minutes during `observing`.
+- Pushing a branch that is not the deploy branch prints `not deploying` and does nothing.
+
+## Not supported: say so, do not improvise
+
+Persistent volumes for the app; buildpacks (a Dockerfile is required); interactive shells or consoles;
+Windows servers; more than about ten servers; a web UI; off-site backups; automatic import from
+other tools (see [Migration](migration.md) for the manual steps and `appdeploy export` for leaving).
+
+## Defaults worth knowing
+
+| Setting | Default |
+|---|---|
+| Deploy branch | `main` |
+| Web port | `EXPOSE` of the image, else `8080` (also passed as `$PORT`) |
+| Health check | `GET /up`, 2xx or 3xx, up to 60 s to start |
+| Memory / CPU per container | 512M / 1 |
+| Watch window after the switch | 3 minutes (roll back above 2% 5xx with at least 20 requests, after 2 restarts, or 3 failed health checks) |
+| Releases kept | 5 |
+| Stop timeout | 30 s |
+| Backups | daily, newest of 7 days and 4 weeks, on the server |
+| Docker image of release N | `ad/APP:vN` |
+| Agent socket | `/run/appdeploy/agent.sock` |
+
+---
+
+<!-- file: docs/getting-started.md -->
+
+# Getting started
+
+This takes you from an empty server to a deployed app with HTTPS. Plan 15 minutes.
+
+## What you need
+
+- A **server**: Debian or Ubuntu with systemd, root access over SSH, and ports 22, 80 and 443
+  reachable. About 1 GB of RAM is enough for a small app; builds need more (a Go or Rails
+  build can use 2 GB). appdeploy installs Docker and Caddy for you.
+- A **domain name** whose DNS `A` record points at the server. Let's Encrypt needs ports 80
+  and 443 to issue the certificate.
+- An **app** in a git repository with a `Dockerfile` at the root. See
+  [what your app must provide](#3-what-your-app-must-provide).
+- On your computer: `git`, `ssh` and the `appdeploy` binary (below).
+
+> The install script has not yet been run on a real server by its authors. It is short and
+> plain shell: read it first (`scripts/install.sh`), and expect to report problems.
+
+## 1. Get the binary and the install script
+
+Pick a release (here `v0.1.1`; see the [releases page](https://github.com/merkushin/appdeploy/releases))
+and download the binary for the server, its checksums, and the install script **of the same
+version**:
+
+```bash
+VERSION=v0.1.1
+BASE=https://github.com/merkushin/appdeploy/releases/download/$VERSION
+curl -fsSLO $BASE/appdeploy-linux-amd64
+curl -fsSLO $BASE/SHA256SUMS
+curl -fsSLO https://raw.githubusercontent.com/merkushin/appdeploy/$VERSION/scripts/install.sh
+sha256sum --check --ignore-missing SHA256SUMS      # on macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+chmod +x appdeploy-linux-amd64 install.sh
+```
+
+Read `install.sh` before you run it; it runs as root. For your **own computer** download the
+matching binary (`appdeploy-darwin-arm64`, `appdeploy-darwin-amd64` or `appdeploy-linux-arm64`),
+rename it to `appdeploy` and put it on your `PATH`.
+
+Releases are signed. The binary verifies the signature of later releases itself
+(`appdeploy self-update`), but the very first download is trusted only as far as GitHub and the
+checksum file are.
+
+## 2. Install on the server
+
+Copy the files and your **public** SSH key to the server and run the script as root:
+
+```bash
+scp appdeploy-linux-amd64 install.sh ~/.ssh/id_ed25519.pub root@my-server:
+ssh root@my-server ./install.sh --binary ./appdeploy-linux-amd64 --ssh-key-file ./id_ed25519.pub
+```
+
+The script installs git, Docker and Caddy, puts the binary in `/usr/local/bin/appdeploy`,
+creates a user `deploy` whose only SSH ability is to run appdeploy, and starts two services:
+`appdeployd` (the agent) and `appdeploy-caddy`. It is safe to run again. Keys you pass with
+`--ssh-key` or `--ssh-key-file` are **admins**; add teammates with fewer rights using
+`--deployer-key` (can push, deploy, roll back, read logs) or `--viewer-key` (can only look).
+See [Operations: security](operations.md#security).
+
+It does not change your firewall or `sshd_config`. Allow 22, 80 and 443 and nothing else.
+
+Check that it works from your computer:
+
+```bash
+appdeploy --host deploy@my-server ping
+```
+
+No output and exit status 0 means the agent answered. (`--host` is optional if you set
+`APPDEPLOY_HOST=deploy@my-server`.)
+
+## 3. What your app must provide
+
+appdeploy runs your app as a container built from your Dockerfile, and needs three things:
+
+1. **A `Dockerfile` at the repository root** (or set `build.dockerfile` / `build.context` in
+   [`appdeploy.yml`](configuration.md)). There are no buildpacks.
+2. **Listen on `$PORT`** (default 8080; or `EXPOSE` a port in the Dockerfile, or set
+   `roles.web.port`). Listen on all interfaces, not just `localhost`.
+3. **Answer `GET /up` with a 2xx or 3xx status** once the app is ready. The new version only
+   gets traffic after this passes twice in a row. Use another path with
+   `roles.web.healthcheck.path`.
+
+Also good to know: stop cleanly on `SIGTERM` (you get 30 seconds, `roles.web.stop_timeout`),
+keep state in a database, not in the container (apps get **no persistent volumes**), and read
+configuration from environment variables. A minimal example is in
+[`examples/hello`](../examples/hello).
+
+## 4. Create the app and deploy
+
+```bash
+appdeploy --host deploy@my-server apps create myapp --domain myapp.example.com
+```
+```
+created app myapp (deploy branch main)
+  git remote add prod <user>@<server>:myapp
+  git push prod main
+```
+
+In your project:
+
+```bash
+git remote add prod deploy@my-server:myapp
+git push prod main
+```
+
+You see the deploy as it happens, prefixed with `remote:`. The first deploy builds the image
+and takes a while:
+
+```
+remote: queued (push)
+remote: ==> validating
+remote: commit 7e27d62d (no appdeploy.yml: using defaults)
+remote: memory: 0B reserved + 512.0MiB for this release of 13.3GiB available
+remote: ==> building
+remote: ==> starting
+remote: started ad-myapp-v1-web-1 (role web)
+remote: ==> verifying
+remote: ad-myapp-v1-web-1: healthcheck GET /up ok
+remote: ==> switching
+remote: ==> succeeded: myapp is now serving v1
+```
+
+Visit `https://myapp.example.com`. The certificate is requested on the first request and can
+take a few seconds.
+
+**Important:** `git push` exits with status 0 even when the deploy fails, because git ignores
+what the server's hook reports after accepting your push. Read the `remote:` lines, or in
+scripts and CI use `appdeploy deploy` (below), which exits non-zero on failure.
+
+Watch the state at any time:
+
+```bash
+appdeploy --host deploy@my-server status myapp
+```
+```
+myapp  release v1  domains: myapp.example.com
+
+CONTAINER          ROLE  RELEASE  STATE
+ad-myapp-v1-web-1  web   v1       running
+
+Recent deploys:
+2026-11-14 03:09:06  v1  push  succeeded
+```
+
+## 5. Configure it
+
+Put a file `appdeploy.yml` in the repository root only when the defaults do not fit. Every
+setting is optional ([full reference](configuration.md)):
+
+```yaml appdeploy.yml
+roles:
+  web:
+    memory: 256M
+    healthcheck:
+      path: /healthz
+  worker:
+    cmd: worker            # the image's ENTRYPOINT gets this as arguments
+    memory: 128M
+release_command: migrate   # runs once, before traffic moves
+services:
+  postgres: true           # gives the app DATABASE_URL and daily backups
+```
+
+Secrets and environment variables are set from the command line and stored on the server:
+
+```bash
+appdeploy --host deploy@my-server secrets set myapp SESSION_SECRET=... STRIPE_KEY=...
+```
+
+This makes a new release (without rebuilding) so the running app picks them up; add
+`--no-deploy` to store them for the next release instead.
+
+## 6. Day to day
+
+```bash
+git push prod main                                   # deploy
+appdeploy --host deploy@my-server logs myapp -f      # follow logs
+appdeploy --host deploy@my-server releases myapp     # list releases
+appdeploy --host deploy@my-server rollback myapp     # back to the previous release
+appdeploy --host deploy@my-server exec myapp -- <command>   # run a command in the running container (no terminal)
+```
+
+For deploying from CI, see [Operations: deploying from CI](operations.md#deploying-from-ci).
+
+## Next
+
+- How it works, and why a deploy takes about three minutes: [Concepts](concepts.md)
+- All commands: [Commands](commands.md)
+- More than one server: [Server groups](groups.md)
+- Something went wrong: [Troubleshooting](troubleshooting.md)
+- Coming from another tool: [Migration](migration.md)
+
+---
+
+<!-- file: docs/concepts.md -->
+
+# Concepts
+
+## The pieces
+
+- **The agent** (`appdeploy agent`, service `appdeployd`) runs on every server as root. It owns
+  the state, runs deploys, talks to Docker and Caddy, and answers the CLI over a unix socket.
+- **Caddy** (service `appdeploy-caddy`) is the reverse proxy and gets the TLS certificates. The
+  agent reconfigures it through its admin API. It is a separate process, so restarting the agent
+  never interrupts traffic.
+- **Docker** runs your containers. appdeploy uses the `docker` command line.
+- **The CLI** is the same binary. `appdeploy --host deploy@server <command>` runs the command
+  on the server over SSH; the server side of that is a *forced command*, so the SSH user can do
+  nothing but run appdeploy (see [Operations: security](operations.md#security)).
+- **git**: each app has a bare repository on the server. Pushing to its deploy branch starts a
+  deploy through a `post-receive` hook.
+
+## Apps, roles, releases
+
+An **app** is something you deploy: a name, domains, a git repository, secrets and a config.
+
+A **role** is one kind of process of the app. `web` is special: it gets HTTP traffic, a health
+check and the domains. Any other role (`worker`, `jobs`, ...) is just a command that must keep
+running. Roles can be placed on different servers with [labels](groups.md).
+
+A **release** is one deployable version: an image, the configuration it was deployed with and a
+frozen copy of the app's secrets. Releases are numbered `v1`, `v2`, ... and the numbers never
+repeat (a failed deploy uses up its number, so you can see `v1`, `v3`). The last five releases
+(`keep_releases`) are kept so you can roll back to them.
+
+Because a release freezes its secrets, **rolling back also restores the old secrets**.
+
+## What happens in a deploy
+
+A deploy is a state machine run by the agent. Every step is written to the agent's journal
+*before* it runs, which is how it survives crashes. Your terminal only watches.
+
+| State | What happens |
+|---|---|
+| `queued` | Waiting. Deploys of one app run one at a time; if several wait, only the newest runs and the others become `superseded`. |
+| `validating` | Reads the commit and its `appdeploy.yml`, checks memory (the sum of container limits must fit in RAM minus a reserve) and disk. |
+| `building` | `docker build` from your Dockerfile. Builds run one at a time per server. |
+| `migrating` | Only if `release_command` is set: runs it once in a throwaway container of the new image, **before** any traffic moves. |
+| `starting` | Starts the new containers next to the old ones. |
+| `verifying` | Probes `GET /up` of each new web container until it answers 2xx/3xx twice in a row (up to `healthcheck.start_period`), then any `smoke` paths. Worker roles must stay up a few seconds. |
+| `switching` | One proxy change moves the domains to the new containers. The old ones keep running. |
+| `observing` | The **watchdog** (below) watches the new release for `watch.window`. |
+| `succeeded` | The old release is stopped and removed; old images beyond `keep_releases` are pruned. |
+| `failed` | Something went wrong **before** traffic moved: the new containers, image and release are removed; the old release never stopped serving. |
+| `rolled_back` | The watchdog moved traffic back to the old release and removed the new one. |
+
+So a deploy normally takes the build time plus the observation window, **3 minutes by
+default**. Lower it with `watch.window` if that is too long for you; the deploy has already
+switched traffic by then, so the wait is only for the safety net.
+
+## The watchdog
+
+After the switch the previous release stays running. For `watch.window` the agent counts
+responses of the new release from Caddy's access log and watches its containers. It rolls back
+(by switching the proxy, so it is immediate) if:
+
+- more than `max(watch.error_rate, 2 x the previous release's error rate)` of the requests got
+  a 5xx answer, with at least `watch.min_requests` requests (needs the access log, which the
+  install script configures);
+- a container restarted `watch.max_restarts` times or exited;
+- the health check fails three times in a row.
+
+The first deploy of an app has nothing to go back to, so it completes at once. Latency is not
+watched.
+
+## Migrations and the old version
+
+`release_command` (for example `bin/rails db:migrate`) runs before the switch. While it and
+the new containers start, **the old release is still serving**, and after a rollback it serves
+again. So migrations must work with the old code too: add a column first, remove the old one in
+a later release. appdeploy does not run down-migrations.
+
+If the old release starts failing right after the migration (more 5xx than before), the deploy
+does not stop, because the migration is already applied and the new code is the fastest fix. It
+logs `WARNING migration.suspect` and sends a webhook so a human knows why.
+
+## Crash safety
+
+- Killing `git push` does not stop the deploy; the agent runs it.
+- If the agent dies or restarts mid-deploy, it resumes the deploy from the journal (a build
+  starts again, mostly from cache; a switch is completed or reverted).
+- The agent is not in the traffic path, so restarting or updating it does not affect running
+  apps.
+
+## State
+
+Everything the agent knows is under `/var/lib/appdeploy` (see
+[Configuration: files on disk](configuration.md#files-on-disk)): a SQLite database with apps,
+releases and the deploy journal, the git repositories, secrets (mode 0600) and backups.
+
+## Where appdeploy has opinions
+
+- Containers are stateless: **no volumes for your app.** Persistent data belongs in Postgres,
+  Redis or an external service. appdeploy can run Postgres and Redis for you
+  (`services:`), with backups.
+- You provide a Dockerfile. appdeploy never guesses a build.
+- One web port per app, one proxy per server. Spreading traffic across several servers is up to
+  a load balancer in front; each server answers `GET /health/<app>` for it.
+
+---
+
+<!-- file: docs/commands.md -->
+
+# Commands
+
+```
+appdeploy [--host user@host] [--socket path] <command> [arguments]
+```
+
+- **`--host user@host`** (or the environment variable `APPDEPLOY_HOST`) runs the command on that
+  server over SSH. Without it the command talks to the agent on this machine.
+- **`--socket path`** (or `APPDEPLOY_SOCKET`) is the agent's socket, default
+  `/run/appdeploy/agent.sock`. You need it only when running on the server yourself.
+- **Exit status:** `0` success, `1` the command failed (an error is printed to stderr, a deploy
+  that did not succeed counts as a failure), `2` wrong usage.
+- **Roles.** Over SSH, what you may run depends on your key's role: a *viewer* can run the
+  read-only commands, a *deployer* adds deploy, rollback and logs, an *admin* can run everything.
+  The tables below say which. See [Operations: security](operations.md#security).
+
+Most commands that change something stream the agent's journal until the deploy ends, so you
+see what a `git push` shows. Press Ctrl-C to stop watching; **the deploy continues on the server**
+(its id is printed so you can look it up).
+
+## Reading
+
+| Command | Role | |
+|---|---|---|
+| [`appdeploy ping`](#appdeploy-ping) | viewer | is the agent up |
+| [`appdeploy status`](#appdeploy-status) | viewer | what runs |
+| [`appdeploy apps list`](#appdeploy-apps-list) | viewer | all apps |
+| [`appdeploy releases`](#appdeploy-releases) | viewer | releases of an app |
+| [`appdeploy logs`](#appdeploy-logs) | deployer | container logs |
+| [`appdeploy secrets list`](#appdeploy-secrets) | deployer | names of secrets |
+| [`appdeploy db list`](#appdeploy-db-backup-list-restore) | viewer | backups of an app |
+| [`appdeploy group servers`](#appdeploy-group) | viewer | servers of a group |
+| [`appdeploy version`](#appdeploy-version) | any | version of this binary |
+
+## appdeploy ping
+
+Exits 0 and prints nothing if the agent answers.
+
+## appdeploy status
+
+```
+appdeploy status [<app>]
+```
+
+Without an app: the list of apps (same as `apps list`). With an app: its live release,
+domains, containers with their state (and restart counts) and the last five deploys.
+
+```
+shop  release v2  domains: shop.example.com
+
+CONTAINER               ROLE  RELEASE  STATE
+adocs498-shop-v2-web-1  web   v2       running
+
+Recent deploys:
+2026-11-14 03:09:21  v2  rollback  succeeded
+2026-11-14 03:09:16  v3  push      succeeded
+2026-11-14 03:09:14  v1  rollback  succeeded
+```
+
+A deploy's *source* is `push`, `cli` (`appdeploy deploy`), `redeploy`, `rollback`, `image`
+(`deploy --image`); in a group also `peer`, `build` and `undo` (work a coordinator asked this
+server to do). Deploy states are in [Concepts](concepts.md#what-happens-in-a-deploy).
+
+## appdeploy apps create
+
+```
+appdeploy apps create <app> [--domain <domain>]... [--branch main]
+```
+
+Registers an app and creates its git repository. The name is lowercase letters, digits and
+dashes, starting with a letter, at most 32 characters. Repeat `--domain` for several domains.
+`--branch` is the branch that deploys when pushed (default `main`; an `appdeploy.yml` `branch:`
+overrides it). Fails if the app exists. **Admin.**
+
+```
+created app shop (deploy branch main)
+  git remote add prod <user>@<server>:shop
+  git push prod main
+```
+
+## appdeploy apps list
+
+```
+APP   RELEASE  DOMAINS
+shop  v1       shop.example.com
+```
+
+## appdeploy apps destroy
+
+```
+appdeploy apps destroy <app>
+```
+
+**Destructive.** Stops and removes the app's containers, removes its images, network, git
+repository, releases, secrets and routes. It **keeps** the app's Postgres database and role and
+its backups (delete them by hand if you want them gone). Refuses while a deploy is running.
+**Admin.**
+
+## appdeploy deploy
+
+```
+appdeploy deploy <app> [--ref <sha-or-ref>] [--detach]
+appdeploy deploy <app> --image <image> [--config appdeploy.yml] [--detach]
+```
+
+Deploys without a push. Without `--ref` it deploys the head of the app's deploy branch in the
+server's repository. `--ref` takes a commit that is already in the server's repository (push it
+to another branch first). The command waits and **exits non-zero if the deploy did not
+succeed**, which makes it the right tool for scripts and CI. `--detach` prints the deploy id and
+returns.
+
+`--image` deploys a finished image instead of building one: the server uses it if Docker has it,
+otherwise pulls it (a private registry needs `docker login` on the server). `--config` sends an
+`appdeploy.yml` to use (`--config -` reads it from standard input; a file name is read on the
+machine where the command runs, which with `--host` is the server); without it the config of the live release is reused, or the defaults on a
+first deploy. **Deployer.**
+
+## appdeploy redeploy
+
+```
+appdeploy redeploy <app> [--detach]
+```
+
+New release from the **current image** with the **current secrets**: no build. Use it to pick up
+changes made with `secrets set --no-deploy`. **Deployer.**
+
+## appdeploy rollback
+
+```
+appdeploy rollback <app> [--to <N>] [--detach]
+```
+
+Re-activates an older release: by default the newest one older than the current. It starts the
+old image again (with the secrets and config that release had), verifies it, switches traffic
+and stops the newer release. It does not create a new release number and is not watched by the
+watchdog. If the image of that release was pruned, it fails. In a group it goes back on every
+server. **Deployer.**
+
+## appdeploy releases
+
+```
+RELEASE  COMMIT    CREATED              
+v3       75965914  2026-11-14 03:09:17  <- current
+v2       7e27d62d  2026-11-14 03:09:10  
+v1       7e27d62d  2026-11-14 03:09:08  
+```
+
+## appdeploy logs
+
+```
+appdeploy logs <app> [--role <role>] [-f] [--tail <N>]
+```
+
+Logs of the containers of the live release, every line prefixed with the container's name.
+`--tail` lines per container (default 100), `-f` to follow, `--role` to pick one role.
+Containers keep at most three 20 MB log files. **Deployer.**
+
+## appdeploy exec
+
+```
+appdeploy exec <app> [--role <role>] -- <command> [arguments...]
+```
+
+Runs a command inside a running container of the live release (the first one of the role,
+default `web`). Output is streamed; the exit status is the command's. There is **no terminal**:
+no interactive shells or consoles. The command must exist in your image. **Admin.**
+
+## appdeploy secrets
+
+```
+appdeploy secrets set <app> KEY=value... [--no-deploy]
+appdeploy secrets unset <app> KEY... [--no-deploy]
+appdeploy secrets list <app>
+appdeploy secrets export <app>
+```
+
+Secrets are environment variables stored on the server (file mode 0600). `KEY` is letters,
+digits and underscores, not starting with a digit; values must be one line.
+
+- `set` and `unset` create a **new release without rebuilding** so running containers get the
+  change, and stream it like a deploy. With `--no-deploy` they only store the change for the
+  next release (use `redeploy` to apply it).
+- `list` prints names only. **Deployer.**
+- `export` prints `KEY=value` lines **with values**. It exists to take your secrets with you
+  when migrating. **Admin.**
+- `set` and `unset` are **admin**.
+
+A secret with the same name as a generated variable (`DATABASE_URL`, `REDIS_URL`) wins, which is
+how an app is pointed at an external database. Values given on the command line are visible in
+your shell history and the process list while the command runs.
+
+## appdeploy domains set
+
+```
+appdeploy domains set <app> <domain>...
+```
+
+Replaces the app's domains and reconfigures the proxy at once; no deploy. Domains from
+`appdeploy.yml` (`domains:`) are added to these. **Admin.**
+
+## appdeploy export
+
+```
+appdeploy export <app> --format kamal|compose|k8s|fly [--out <dir>]
+```
+
+Writes the live release's setup in the format of another tool: roles, ports, limits, health
+path, domains, the names of secrets (never values) and servers by label. Without `--out` the files
+are printed with `==> path <==` headers. See [Migration](migration.md#leaving-appdeploy).
+**Admin.**
+
+## appdeploy db backup, list, restore
+
+```
+appdeploy db backup <app>
+appdeploy db list <app>
+appdeploy db restore <app> <backup-name>
+```
+
+For apps with `services: {postgres: true}`. `backup` runs `pg_dump` now into
+`/var/lib/appdeploy/backups/<app>/<UTC time>.sql.gz` and applies the retention (the newest of each
+of the last 7 days and of the last 4 weeks). The agent also backs up every app daily. `list`
+prints names, newest first. **`restore` replaces the tables of the app's database with the
+backup's.** `list` is viewer; `backup` and `restore` are **admin**. Backups stay on the server's
+disk: copy them elsewhere.
+
+## appdeploy group
+
+See [Server groups](groups.md) for the concepts.
+
+```
+appdeploy group init --server <name> --advertise <host:port> [--labels web,db] [--group <name>] [--data-dir <dir>]
+appdeploy group join --token <token> --server <name> --advertise <host:port> [--labels web] [--data-dir <dir>]
+appdeploy group invite
+appdeploy group servers
+appdeploy group set-version <vX.Y.Z | none>
+appdeploy group remove <name>
+```
+
+- `init` and `join` run **locally, before the agent starts** (they prepare the server's
+  identity under the data directory); the others talk to the agent.
+- `invite` (founder only) prints a command to run on the new server; the token works once, for
+  one hour.
+- `servers` lists members with their labels, agent version and state.
+- `set-version` (founder only) makes every server install that release, one at a time, in name
+  order. `none` clears it.
+- `remove` (founder only) drops a server from the group.
+
+Everything except `servers` is **admin**; `servers` is viewer.
+
+## appdeploy self-update
+
+```
+appdeploy self-update [--check] [--force] [--repo owner/name]
+```
+
+Asks the agent to install the latest GitHub release if it is newer and correctly signed, then
+restart. `--check` only reports. `--force` allows the same or an older version and installing
+while deploys are running. See [Operations: updating](operations.md#updating-appdeploy).
+**Admin.**
+
+## appdeploy version
+
+Prints `appdeploy <version>` (`dev` for a build that did not come from a release).
+
+## appdeploy agent, hook, shell, recover
+
+Used by the system, not by you:
+
+- `appdeploy agent [flags]` runs the agent ([flags](configuration.md#agent-flags)).
+- `appdeploy hook post-receive` is called by git after a push.
+- `appdeploy shell` is the SSH forced command.
+- `appdeploy recover` runs before each start of the service and puts the old binary back after
+  a failed update.
+
+---
+
+<!-- file: docs/configuration.md -->
+
+# Configuration
+
+There are three places to configure things:
+
+1. [`appdeploy.yml`](#appdeployyml) in your repository: how an app is built and run.
+2. Commands: secrets, domains, apps ([Commands](commands.md)).
+3. [Agent flags](#agent-flags): how a server's agent behaves; set once when installing.
+
+## appdeploy.yml
+
+An optional file at the root of your repository. It is read **from the commit being deployed**,
+so a config change is an ordinary commit. Unknown keys are an error (a typo cannot be silently
+ignored). With no file, all defaults apply: one `web` role.
+
+```yaml appdeploy.yml
+app: shop                    # informational; a warning if it differs from the app's name
+branch: main                 # the branch that deploys when pushed
+
+build:
+  dockerfile: Dockerfile     # relative to the build context
+  context: .                 # relative to the repository root
+  args: {}                   # --build-arg values: not for secrets, they end up in image history
+
+domains: [shop.example.com]  # in addition to the ones set with `domains set`
+
+roles:
+  web:
+    port: 3000
+    memory: 512M
+    cpus: 1
+    healthcheck: {path: /up, timeout: 5s, start_period: 60s}
+    smoke: [/, /pricing]
+    stop_timeout: 30s
+  worker:
+    cmd: worker
+    memory: 256M
+
+release_command: migrate up
+services:
+  postgres: true
+  redis: false
+watch:
+  window: 3m
+  error_rate: 2%
+  min_requests: 20
+  max_restarts: 2
+keep_releases: 5
+notify: [https://hooks.slack.com/services/...]
+```
+
+### Keys
+
+| Key | Default | Meaning |
+|---|---|---|
+| `app` | the app's name | Informational. |
+| `branch` | `main` | Pushing this branch deploys. Overrides the branch chosen at `apps create`. |
+| `build.dockerfile` | `Dockerfile` | Path of the Dockerfile, relative to the context. |
+| `build.context` | `.` | Directory sent to `docker build`, relative to the repository root. Must stay inside the repository. |
+| `build.args` | none | `--build-arg KEY=value`. Not for secrets. |
+| `domains` | none | Domains served by the app. Combined with those set by `appdeploy domains set`. |
+| `roles` | one `web` role | A map of role name to its settings. Names: lowercase letters, digits, `-` and `_`, starting with a letter. A role named `web` receives HTTP traffic. |
+| `roles.<name>.on` | `[web]` | Server labels that run this role; only matters in a [group](groups.md). |
+| `roles.<name>.port` | `EXPOSE` of the image, else `8080` | Port the app listens on. Passed to the app as `PORT`. Web role only. |
+| `roles.<name>.cmd` | image's `CMD` | Replaces the image's `CMD` (arguments to its `ENTRYPOINT`). Quotes are respected, no shell is involved. |
+| `roles.<name>.memory` | `512M` | Memory limit (`K`, `M`, `G`; at least `4M`). Swap is off. |
+| `roles.<name>.cpus` | `1` | CPU limit. |
+| `roles.<name>.replicas_per_server` | `1` | Containers of this role per server (1 to 32). |
+| `roles.<name>.healthcheck.path` | `/up` | Web role. Must answer 2xx or 3xx. |
+| `roles.<name>.healthcheck.timeout` | `5s` | Per request. |
+| `roles.<name>.healthcheck.start_period` | `60s` | How long a new container has to become healthy. |
+| `roles.<name>.smoke` | none | Extra paths (starting with `/`) that must answer below 500 before the switch. |
+| `roles.<name>.stop_timeout` | `30s` | Time to finish in-flight work after `SIGTERM` before the container is killed. |
+| `release_command` | none | Run once per deploy before traffic moves, in a throwaway container of the new image with the release's environment. Like `cmd` it replaces the image's `CMD`. A failure stops the deploy. |
+| `services.postgres` | `false` | A database for this app on the server's shared Postgres; provides `DATABASE_URL`. |
+| `services.redis` | `false` | A Redis database number on the shared Redis; provides `REDIS_URL`. |
+| `watch.window` | `3m` | How long the new release is watched after the switch. |
+| `watch.error_rate` | `2%` | Roll back above this share of 5xx answers (or twice the previous release's rate, if higher). |
+| `watch.min_requests` | `20` | Fewer requests than this in the window are not judged by the error rate. |
+| `watch.max_restarts` | `2` | Roll back when a container restarted this many times. |
+| `keep_releases` | `5` | Releases (and their images) kept for rollback. |
+| `allow_partial` | `false` | In a group, roll out to the reachable servers and let the others catch up, instead of stopping at an unreachable one. |
+| `notify` | none | Webhook URLs for this app's events (see [Operations](operations.md#notifications)). |
+
+Roles other than `web` have no health check; they pass `verifying` if they are still running a
+few seconds after start.
+
+### The environment of your containers
+
+Every container gets the app's secrets, plus:
+
+| Variable | Value |
+|---|---|
+| `PORT` | the web role's port (web role only) |
+| `APPDEPLOY_APP`, `APPDEPLOY_RELEASE`, `APPDEPLOY_ROLE` | the app, the release number, the role name |
+| `APPDEPLOY_SERVER` | the server's name (in a group) |
+| `DATABASE_URL`, `REDIS_URL` | when `services` asks for them (a secret of the same name wins) |
+
+## Agent flags
+
+Set on the `appdeploy agent` command line; for the installed service, edit `ExecStart` in
+`/etc/systemd/system/appdeployd.service` and `systemctl daemon-reload && systemctl restart appdeployd`.
+The install script sets the ones it needs.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--data-dir` | `/var/lib/appdeploy` | State directory. |
+| `--socket` | `/run/appdeploy/agent.sock` | Control socket. |
+| `--socket-group` | none (root only) | Group allowed to use the socket (the install script uses `appdeploy`). |
+| `--repo-owner` | none | Unix user that owns app git repositories: the SSH user (`deploy`). |
+| `--instance` | `ad` | Prefix of Docker names, so several agents can share one Docker (tests). |
+| `--caddy-admin` | `http://127.0.0.1:2019` | Caddy's admin API, or `none` to run without a proxy. |
+| `--caddy-listen` | `:443` | Where Caddy serves apps. |
+| `--caddy-admin-listen` | none | Re-declare Caddy's admin address in the config it is given (needed when Caddy runs in a container). |
+| `--no-tls` | off | Plain HTTP only (testing). |
+| `--upstream-host` | `127.0.0.1` | Host the proxy uses to reach containers. |
+| `--access-log` | none | Caddy's access log, read by the watchdog. Without it the watchdog only sees restarts and health. |
+| `--caddy-access-log` | same as `--access-log` | The log's path as Caddy sees it, if different. |
+| `--default-watch-window` | `3m` | `watch.window` for apps that do not set it. |
+| `--min-free-bytes` | 5 GiB | Refuse to build with less free disk. |
+| `--min-free-frac` | `0.10` | Refuse to build below this free fraction; also the `disk.low` alert threshold. |
+| `--monitor-every` | `30s` | How often to look for crashed containers and low disk (0 = never). |
+| `--notify-url` | none | A webhook for every app's events (repeatable). |
+| `--backup-every` | `24h` | Postgres backups of all apps that use it (0 = never). |
+| `--prune-build-cache` | off | After each deploy remove Docker build cache unused for this long (e.g. `168h`). Off because the cache is shared with everything else on that Docker. |
+| `--network-pool` | Docker's default | CIDR to carve /24 networks for apps from (e.g. `172.80.0.0/12`). Docker's default pool holds only ~30 networks. |
+| `--health-listen` | off | Address for `GET /health/<app>`, for load balancers. |
+| `--peer-listen` | the advertised port | Address of the server-to-server API in a group. |
+| `--update-repo` | `merkushin/appdeploy` | GitHub repository releases come from. |
+| `--update-api` | GitHub's API | API URL for self-update (tests). |
+| `--update-check-every` | `1m` | How often a group member checks whether it is its turn to install the group's wanted version (0 = never). |
+| `--update-confirm-after` | `1m` | How long a freshly updated agent must stay healthy to count the update as good. |
+
+## Files on disk
+
+| Path | Contents |
+|---|---|
+| `/usr/local/bin/appdeploy` | the binary; `appdeploy.previous` after an update, `appdeploy.failed` after a revert |
+| `/var/lib/appdeploy/state.db` | apps, releases, deploy journal (SQLite) |
+| `/var/lib/appdeploy/apps/<app>/repo.git` | the app's git repository |
+| `/var/lib/appdeploy/apps/<app>/releases/` | the frozen secrets of each release (mode 0600) |
+| `/var/lib/appdeploy/secrets/<app>.env` | the app's current secrets (mode 0600) |
+| `/var/lib/appdeploy/services/` | generated Postgres and Redis credentials |
+| `/var/lib/appdeploy/backups/<app>/` | database backups |
+| `/var/lib/appdeploy/group/` | the group's CA, this server's certificate and the member list |
+| `/var/lib/appdeploy/update-pending.json`, `update-failed.json` | update bookkeeping (see [Operations](operations.md#updating-appdeploy)) |
+| `/var/lib/appdeploy/caddy/` | Caddy's certificates and saved config |
+| `/var/log/appdeploy/access.log` | Caddy's JSON access log (rotated, 3 x 20 MB) |
+| `/home/deploy/.ssh/authorized_keys` | who may use appdeploy, with their role |
+
+---
+
+<!-- file: docs/api.md -->
+
+# HTTP API
+
+The agent serves a JSON API over a **unix socket** (default `/run/appdeploy/agent.sock`). The
+CLI is a client of it. Access is by file permission on the socket: root, plus the socket group if
+configured. There is no other authentication, and **no TCP listener** for it.
+
+```bash
+curl -s --unix-socket /run/appdeploy/agent.sock http://agent/v1/apps
+```
+
+Errors are `{"error":"message"}` with status 400 (404 if not found). The API is not versioned
+beyond the `/v1` prefix and may change before 1.0; the CLI is the stable interface.
+
+Times are RFC 3339. A deploy's `state` is one of `queued`, `validating`, `building`, `migrating`,
+`starting`, `verifying`, `switching`, `observing`, `succeeded`, `failed`, `rolled_back`,
+`superseded` (and `distributing`, `rolling` for a coordinator in a group).
+
+## Apps
+
+| Request | Body | Answer |
+|---|---|---|
+| `GET /v1/ping` | | `{"ok":true}` |
+| `POST /v1/apps` | `{"name","domains":[],"branch"}` | 201, the app: `{"name","domains","branch","current_release","created_at"}` |
+| `GET /v1/apps` | | list of apps |
+| `GET /v1/apps/{app}` | | `{"app":{...},"containers":[{"name","role","release","running","restarts","host_port"}],"deploys":[{"id","app","release","state","error","ref","source","started_at","finished_at"}],"releases":[{"number","commit","image","created_at","current"}]}` |
+| `DELETE /v1/apps/{app}` | | `{"ok":true}` (destructive) |
+| `PUT /v1/apps/{app}/domains` | `{"domains":[]}` | `{"ok":true}` |
+| `GET /v1/apps/{app}/releases` | | list of releases |
+| `GET /v1/apps/{app}/export?format=kamal` | | `{"files":{"path":"content"}}` |
+
+## Deploying
+
+Each of these answers `202 {"deploy_id":"..."}` and returns at once; follow the deploy with the
+events endpoint.
+
+| Request | Body |
+|---|---|
+| `POST /v1/apps/{app}/deploy` | `{"ref":"sha-or-ref"}` or `{"image":"ref","config_yaml":"..."}` |
+| `POST /v1/apps/{app}/redeploy` | none |
+| `POST /v1/apps/{app}/rollback` | `{"to":N}` (0 or absent: the previous release) |
+| `POST /v1/apps/{app}/push` | `{"ref":"refs/heads/main","sha":"..."}`; called by the git hook; answers 200 `{"message"}` if the ref is not the deploy branch |
+| `GET /v1/deploys/{id}` | the deploy, as above |
+| `GET /v1/deploys/{id}/events?after=N` | newline-delimited JSON: `{"id","time","msg"}` for each journal line, ending with `{"done":true,"state","error"}` |
+
+The events stream is how to wait: read until a line with `"done":true` and check `state`
+(`succeeded` is success). Reconnect with `after=<last id>` if the connection drops; the deploy
+does not depend on it.
+
+## Secrets, logs, commands
+
+| Request | Body | Answer |
+|---|---|---|
+| `GET /v1/apps/{app}/secrets` | | `{"names":[...]}` |
+| `GET /v1/apps/{app}/secrets?reveal=1` | | `{"values":{"KEY":"value"}}` (secret values) |
+| `POST /v1/apps/{app}/secrets` | `{"set":{"K":"v"},"unset":["K"],"deploy":true}` | `{"deploy_id"}` if `deploy` and the app has a release |
+| `GET /v1/apps/{app}/logs?role=web&follow=1&tail=100` | | text, lines prefixed with the container name |
+| `POST /v1/apps/{app}/exec` | `{"role":"web","cmd":["ls","/"]}` | the output as a stream; the exit status is in the HTTP trailer `Appdeploy-Exit` |
+
+## Databases
+
+| Request | Body | Answer |
+|---|---|---|
+| `POST /v1/apps/{app}/db/backup` | | `{"path"}` |
+| `GET /v1/apps/{app}/db/backups` | | `["name",...]`, newest first |
+| `POST /v1/apps/{app}/db/restore` | `{"file":"name"}` | `{"ok":true}`; replaces the database's tables |
+
+## Group and updates
+
+| Request | Body | Answer |
+|---|---|---|
+| `GET /v1/group` | | members and wanted version; 400 if not in a group |
+| `GET /v1/group/versions` | | `{"desired","servers":[{"name","addr","labels","version","reachable","busy","error"}]}` |
+| `POST /v1/group/invite` | | `{"token"}` (founder) |
+| `POST /v1/group/version` | `{"version":"v1.2.3"}` or `""` | the group state (founder) |
+| `DELETE /v1/group/servers/{name}` | | the group state (founder) |
+| `POST /v1/self-update` | `{"check":false,"force":false,"repo":""}` | `{"log":[...],"from","to","updated","error"}`; after `updated`, the agent restarts in a second |
+
+## Health endpoint
+
+With `--health-listen`, a separate TCP listener answers `GET /health/{app}` with 200 `ok` when this
+server runs a web container of the app's live release, else 503 (`not serving`, or `switching`
+while traffic is being moved). Nothing else, and no authentication, for load balancers.
+
+## Peer API (between servers)
+
+Served over mutual TLS on the peer port; not for you to call. It is listed so that you know what
+a group exposes: `POST /peer/v1/join`, `GET /peer/v1/ping`, `GET /peer/v1/version`,
+`GET /peer/v1/group`, `PUT /peer/v1/group`, `POST /peer/v1/image`, `GET /peer/v1/image`,
+`POST /peer/v1/source`, `POST /peer/v1/deploy`, `GET /peer/v1/deploys/{id}/events`,
+`GET /peer/v1/finals`, `PUT /peer/v1/final`, `GET /peer/v1/release`.
+
+---
+
+<!-- file: docs/groups.md -->
+
+# Server groups
+
+A **group** is a few servers (1 to about 10) that deploy together. Use one when you want an app
+or its worker on several machines, a separate build server, or to run different roles of one
+app on different servers. A single server needs no group.
+
+## How it works
+
+- Every server has a name and **labels** (`web`, `db`, `worker`, `builder`, anything you like).
+- A role runs on the servers whose labels match its `on:` list (default `[web]`).
+- The first server creates the group and is its **founder**; it holds the group's private
+  certificate authority. Others join with a one-hour, single-use invite token. All
+  server-to-server traffic is TLS 1.3 with certificates from that authority on both sides.
+- You deploy as usual by pushing to **one** server (the app's git repository lives only there:
+  always push to the same one). That server is the **coordinator** of the deploy.
+
+A deploy in a group:
+
+1. The coordinator checks out the commit and builds the image **once** (on a server with the
+   label `builder` if there is one), runs `release_command` once, and sends the image to the
+   other servers directly (no registry).
+2. It rolls out in **waves**: up to 3 target servers one at a time; with more, a canary first and
+   then 25% at a time. Each server runs the normal sequence (start, verify, switch, observe). The
+   canary is watched for at most a minute, later waves for at most 20 seconds, instead of the
+   full `watch.window`.
+3. If a server fails in a later wave, the servers that already switched are **taken back** to
+   their previous release and the deploy fails with `rollout stopped in wave N`.
+4. Rollback (`appdeploy rollback`) goes back on every server.
+
+Each server routes only to its own containers: spread traffic across servers with a load
+balancer or DNS in front. Each server answers `GET /health/<app>` (enable it with
+`--health-listen`) with 200 when it runs the app and 503 otherwise, including for the moment
+traffic is being switched.
+
+## Set up a group
+
+You need each server to be able to reach the others on the **peer port** (the port in
+`--advertise`, e.g. 7070); nothing else is exposed between them. Install appdeploy on every
+server first ([Getting started](getting-started.md)).
+
+**1. Create the group on the first server (the founder):**
+
+```bash
+ssh root@a systemctl stop appdeployd
+ssh root@a appdeploy group init --server a --advertise a.internal:7070 --labels web,db --group prod
+ssh root@a systemctl start appdeployd
+```
+
+`--advertise` is the address other servers use to reach this one. The certificate is issued for
+that host name or IP, so use the same name later.
+
+**2. Invite a server** (from your computer; admin):
+
+```bash
+appdeploy --host deploy@a group invite
+```
+
+It prints the command to run on the new server.
+
+**3. On the new server**, after installing appdeploy, run it **before the agent runs**:
+
+```bash
+ssh root@b systemctl stop appdeployd
+ssh root@b appdeploy group join --server b --advertise b.internal:7070 --labels web --token <token>
+ssh root@b systemctl start appdeployd
+```
+
+**4. Look at the result:**
+
+```bash
+appdeploy --host deploy@a group servers
+```
+```
+SERVER  ADDRESS            LABELS    VERSION  STATE
+a       a.internal:7070    web,db    0.1.1    ok
+b       b.internal:7070    web       0.1.1    ok
+```
+
+The member list is replicated: every server learns of changes within seconds, and a server that
+was down learns when it returns. `group remove <name>` (on the founder) drops a server.
+
+Back up `/var/lib/appdeploy/group/` on the founder: it holds the authority's key. Without it you
+cannot add servers; there is no key rotation yet. Everything else keeps working.
+
+## Using labels
+
+```yaml appdeploy.yml
+roles:
+  web:
+    on: [web]            # on every server labeled web
+    replicas_per_server: 2
+  worker:
+    on: [worker]
+    cmd: worker
+release_command: migrate
+```
+
+- A server runs only the roles whose labels match. A server with none of an app's labels does
+  nothing for it (it can still be the coordinator or the builder).
+- Domains are served by every server that runs the `web` role; put DNS or a balancer in front.
+  Servers learn an app's domains when they deploy it: after `domains set` on the coordinator,
+  run `appdeploy redeploy` so the others get them too.
+- `release_command` runs once, on the coordinator, before any server switches.
+- `services:` (Postgres, Redis) are only available when every role of the app runs on the
+  coordinating server. For an app spread over servers use an external database through a
+  `DATABASE_URL` secret.
+
+## Build servers
+
+A server with the label `builder` builds for the group: the coordinator sends it the source,
+it builds under its own build slot and disk check, and the coordinator fetches the image. It
+removes its copy afterwards. With several, the first by name is used. If the coordinator is
+itself a builder, it builds locally. Give a builder a lot of RAM and disk and no app roles.
+
+## When a server is down
+
+By default a deploy stops with `server X is not reachable` before anything changes. With
+`allow_partial: true` the reachable servers get the release and the missing one is skipped with
+a warning. When it returns (or joins later), it **catches up by itself**: the coordinator records
+the release a completed rollout left the group on, servers exchange these records, and a server
+that is not on that release fetches it from a peer and runs its part. It does nothing while a
+deploy of that app is running on it, and it never moves an app back if something newer
+succeeded there since.
+
+A server that speaks a different peer **protocol** (only during an update of the group) refuses
+the deploy until all servers run compatible versions.
+
+## Updating all servers
+
+```bash
+appdeploy --host deploy@a group set-version v0.2.0
+```
+
+Every server installs that release itself, one at a time in name order, waiting while anything
+is being deployed, and reverts automatically if the new version does not stay up. Watch it with
+`group servers`. Details: [Operations: updating](operations.md#updating-appdeploy).
+
+## Limits
+
+- 1 to about 10 servers. There is no scheduler: you place roles with labels.
+- The founder is needed to add or remove servers, not to deploy.
+- Every member can call every other member's peer API; there are no per-server permissions.
+- No load balancer is provided.
+
+---
+
+<!-- file: docs/operations.md -->
+
+# Operations
+
+## Deploying from CI
+
+`git push` exits with status 0 even if the deploy fails (git ignores what the hook reports after
+it accepted the push), so a CI job cannot rely on it. Three ways that do work:
+
+**Push to a branch that does not deploy, then deploy by commit.** `deploy` waits and exits
+non-zero if the deploy did not succeed:
+
+```bash
+git push deploy@my-server:myapp HEAD:refs/heads/ci        # not the deploy branch: nothing happens
+appdeploy --host deploy@my-server deploy myapp --ref "$(git rev-parse HEAD)"
+```
+
+**Build the image in CI** and have the server pull it. Log the server in to your registry once
+(`docker login`), then:
+
+```bash
+appdeploy --host deploy@my-server deploy myapp --image registry.example.com/myapp:$GIT_SHA --config - < appdeploy.yml
+```
+
+(`--config` names a file on the machine where the command *runs*, which over `--host` is the server;
+`--config -` reads it from standard input, so it travels from CI. Leave `--config` out to reuse the
+live release's config.)
+
+**Read the push output** for the line `==> succeeded` (and fail if you see `deploy failed`).
+
+Give CI a key with the `deployer` role: it can deploy and roll back, but not read secrets,
+run commands in containers or destroy anything.
+
+## Looking at things
+
+```bash
+appdeploy --host deploy@my-server status myapp
+appdeploy --host deploy@my-server logs myapp -f
+appdeploy --host deploy@my-server releases myapp
+```
+
+On the server: `systemctl status appdeployd appdeploy-caddy`, `journalctl -u appdeployd`,
+`journalctl -u appdeploy-caddy`, `docker ps`. The agent's journal of each deploy is what you
+see during the deploy; the last ones are in `status`.
+
+## Secrets
+
+Secrets are the app's environment variables. `secrets set` stores them (mode 0600, readable by
+root only) and makes a new release without rebuilding. A release keeps a frozen copy, so
+a rollback restores the old values. `secrets list` shows names only; `secrets export` prints
+values (admin) and is the way to take them with you.
+
+To change several at once without restarting the app several times, use `--no-deploy` for all
+but the last, or all with `--no-deploy` and then `appdeploy redeploy`.
+
+## Domains and HTTPS
+
+`appdeploy domains set myapp a.example.com www.a.example.com` takes effect immediately. Caddy
+requests a Let's Encrypt certificate on the first request, so DNS must already point at the
+server and ports 80 and 443 must be open. Unknown host names get a plain `404 no such app`.
+
+## Databases and backups
+
+`services: {postgres: true}` gives the app its own database and role on a Postgres container
+that appdeploy runs for you (`postgres:17-alpine`, data in a Docker volume), and `DATABASE_URL`
+in its environment. The password is generated once and kept across deploys. Redis works the same
+(`REDIS_URL`, a Redis database number per app, up to 15 apps; the numbers separate keys, they
+are not a security boundary).
+
+Backups: every `--backup-every` (24h) the agent writes a gzip `pg_dump` per app to
+`/var/lib/appdeploy/backups/<app>/`, keeping the newest of each of the last 7 days and 4 weeks.
+`appdeploy db backup <app>` takes one now; `db list` lists; `db restore <app> <name>` replaces the
+database's tables with the backup. **Backups live on the same disk as the data**: copy them off the
+server, for example with a nightly job on another machine:
+
+```bash
+rsync -a --delete root@my-server:/var/lib/appdeploy/backups/ /backups/appdeploy/
+```
+
+`apps destroy` keeps an app's database and backups on purpose.
+
+## Notifications
+
+Webhooks receive deploy events from `notify:` in `appdeploy.yml` (per app) and from the agent's
+`--notify-url` (all apps). Slack incoming webhooks and the Telegram Bot API get a text line;
+anything else gets JSON:
+
+```json
+{"event":"deploy.rolled_back","app":"shop","release":3,"deploy_id":"1a1d9518857872f3fbe1d",
+ "state":"rolled_back","commit":"75965914bef2f8d4b6ad882017382889b3e34f04",
+ "error":"3 of 40 requests (7.5%) failed with 5xx, above the 2.0% limit","time":"2026-11-14T09:09:21Z"}
+```
+
+| Event | When |
+|---|---|
+| `deploy.started` | A deploy began (after its config was read). |
+| `deploy.succeeded` | The release is live and its watch window passed. |
+| `deploy.failed` | The deploy failed before traffic moved; the old release still serves. |
+| `deploy.rolled_back` | The watchdog moved traffic back. `error` says why. |
+| `migration.suspect` | The old release started failing right after `release_command`. |
+| `app.crashed` | A container was restarted by Docker, stopped, or is restarting repeatedly. Once per incident, at most every 10 minutes per container. |
+| `disk.low` | Free space on the data disk fell below the build threshold. Once until it recovers. |
+| `backup.failed` | The scheduled database backup failed. |
+| `agent.update_failed` | An update of the agent was reverted. |
+
+Delivery is retried twice for transient errors, not for 4xx answers. URLs are never written to
+logs because they carry secrets.
+
+## Security
+
+- **Ports.** 22, 80 and 443 face the world. In a group, the peer port is used between servers
+  only; the health port (`--health-listen`) answers a bare status. The install script does not
+  touch the firewall: do it yourself.
+- **SSH.** The user `deploy` can run nothing but appdeploy: the key's `authorized_keys` line forces
+  the command `appdeploy shell --role <role>`, which accepts git push/fetch of an existing app and
+  appdeploy commands, and nothing else; options such as `--host` or `--socket` from the client are
+  refused. Roles: `admin` (everything; keys given with `--ssh-key`), `deployer` (push, deploy,
+  redeploy, rollback, logs, secret names), `viewer` (status and lists). Anyone who can run `exec`
+  or `secrets export` (admin) can read every secret.
+- **The agent runs as root** and controls Docker, so whoever controls the agent controls the server.
+  The control socket is accessible to root and, if configured, one group.
+- **Containers** run with the user your image sets (use a non-root `USER`), have memory and CPU
+  limits, no extra privileges, no access to the Docker socket, and a network of their own per app.
+  They publish their port on `127.0.0.1` only.
+- **Secrets** are files with mode 0600 and are put into containers as environment variables. They
+  are not in build arguments, logs or the push output. Values passed to `secrets set` are visible in
+  your shell history and process list.
+- **Group traffic** is mutually authenticated TLS 1.3 with a private authority, joined with
+  single-use tokens that pin the authority's fingerprint.
+- **Updates** are verified with a signature before they are installed; the key is built into the
+  binary.
+
+## Updating appdeploy
+
+Releases are published on GitHub, signed with a key whose public half is built into every binary.
+
+```bash
+appdeploy --host deploy@my-server self-update --check     # is there a newer release
+appdeploy --host deploy@my-server self-update             # install it
+```
+
+The agent downloads the release, verifies the signature and the checksum, runs the new binary
+once, keeps the old one as `/usr/local/bin/appdeploy.previous`, replaces the binary and restarts
+(the service manager starts the new one). Your apps keep running; a deploy in progress resumes. It
+refuses while deploys are running unless you pass `--force`.
+
+**A bad update reverts itself.** Before each start the service runs `appdeploy recover`. If a
+freshly installed version does not manage to stay up (it is confirmed after being healthy for a
+minute), the fourth start puts `appdeploy.previous` back, keeps the bad binary as
+`appdeploy.failed`, and the agent sends `agent.update_failed`. A version that failed is not tried
+again until another is asked for. This needs the `ExecStartPre` line and
+`StartLimitIntervalSec=0` that the install script writes, so run the script again on servers
+installed earlier.
+
+**A whole group** updates from one command on the founder:
+
+```bash
+appdeploy --host deploy@a group set-version v0.2.0
+appdeploy --host deploy@a group servers          # watch the versions change, in name order
+```
+
+To go back by hand: `mv /usr/local/bin/appdeploy.previous /usr/local/bin/appdeploy` and
+`systemctl restart appdeployd`.
+
+## Disk
+
+Old releases beyond `keep_releases` are removed with their images after each deploy, dangling
+images of appdeploy's builds too. Docker's build cache and images unrelated to appdeploy are not
+touched unless you pass `--prune-build-cache`. Docker's disk use is shown by `docker system df`.
+Builds are refused when free disk is below 5 GiB or 10% (`disk.low` is sent at the same
+threshold); the thresholds are agent flags.
+
+## Uninstalling
+
+This deletes all apps' state; export what you need first (see [Migration](migration.md)).
+
+```bash
+# containers and networks of appdeploy (they are labelled appdeploy.instance)
+docker rm -f $(docker ps -aq --filter label=appdeploy.instance)
+docker network rm $(docker network ls -q --filter label=appdeploy.instance)
+systemctl disable --now appdeployd appdeploy-caddy
+rm /etc/systemd/system/appdeployd.service /etc/systemd/system/appdeploy-caddy.service
+rm -r /var/lib/appdeploy /etc/appdeploy /usr/local/bin/appdeploy*
+userdel -r deploy
+```
+
+Docker volumes of Postgres and Redis (`ad-svc-*`) remain: `docker volume rm` them if you want the
+data gone.
+
+---
+
+<!-- file: docs/troubleshooting.md -->
+
+# Troubleshooting
+
+Start with these, on your computer and on the server:
+
+```bash
+appdeploy --host deploy@my-server status myapp          # what runs, and how the last deploys ended
+appdeploy --host deploy@my-server logs myapp --tail 50
+ssh root@my-server systemctl status appdeployd appdeploy-caddy
+ssh root@my-server journalctl -u appdeployd -n 100 --no-pager
+```
+
+A deploy that fails **before traffic moved** (`failed`) leaves the old release serving and cleans
+up after itself, so a failure is usually not an outage. The error message is the last `deploy failed:`
+line of the output.
+
+## The deploy fails
+
+| Message (part of it) | What it means | What to do |
+|---|---|---|
+| `healthcheck GET /up did not pass within 1m0s` | The new container never answered 2xx/3xx on that path. The last lines of its log are printed above. | Check the app listens on `$PORT` on all interfaces, serves `/up` (or set `roles.web.healthcheck.path`), and starts within `start_period`. |
+| `... exited (code 1)` / `exited right after starting` | The container crashed. Its last log lines are printed. | Fix the crash; reproduce with `docker run` locally using the same environment variables. `killed for exceeding its memory limit` means raise `roles.<name>.memory`. |
+| `build failed: ...` | `docker build` failed; the end of its output is in the message and the full output above it. | Fix the Dockerfile; the build ran on the server, so base images must be reachable from it. |
+| `Dockerfile not found in the repository (build.dockerfile)` | No file at `build.dockerfile` inside `build.context`. | Check the paths in `appdeploy.yml`; they are relative to the context, which is relative to the repository root. |
+| `release command failed` | `release_command` exited non-zero, so nothing started. Its output is above. | Fix the migration. Nothing changed for users. |
+| `not enough memory: ... already reserved by running containers + ... needed > ...` | The memory limits of all containers on the server, including the new release's and the old one still running, do not fit in RAM minus a reserve (15% or 512 MB). | Lower limits, remove apps, or use a bigger server. Remember both releases run at once during a deploy. |
+| `not enough disk space to build` | Free disk is below 5 GiB or 10%. | Free space (`docker system df`, `docker image prune`) or lower the thresholds (`--min-free-bytes`, `--min-free-frac`). |
+| `appdeploy.yml: ... field xyz not found` | An unknown key, usually a typo. | Fix it; keys are listed in [Configuration](configuration.md). |
+| `invalid duration "..."` / `invalid size "..."` | A value is wrong. | Use `5s`, `3m`, `512M`, `1G`. |
+| `git ref "..." not found in the app repository` | `deploy --ref X` with a commit the server does not have. | Push it first (to a branch that does not deploy). |
+| `superseded by ...` | A newer deploy of the same app replaced this one while it waited. | Nothing: the newer one runs. |
+| `gave up after N attempts interrupted by agent restarts` | The agent kept restarting during this deploy. | Look at `journalctl -u appdeployd`; deploy again. |
+| `pulling X: ... (private registries need docker login on the server)` | `deploy --image` could not pull it. | `docker login` on the server for a private registry; check the name and tag. |
+| `invalid image reference` | The `--image` value has unexpected characters. | Use `registry/name:tag`. |
+
+## The deploy succeeded, then rolled back
+
+State `rolled_back`; the last lines say `watchdog: ...`:
+
+| Message | Cause |
+|---|---|
+| `N of M requests (x%) failed with 5xx, above the y% limit` | The new version returned errors under real traffic. Look at its logs (`logs` shows the live release only, so read the journal above or reproduce), fix, deploy again. |
+| `... restarted N times` / `... exited` | A container crashed after it passed the checks (a crash loop, memory limit). |
+| `health check GET /up failed 3 times in a row` | The app stopped answering after the switch. |
+
+Raise `watch.error_rate` or lower `watch.min_requests` only if the thresholds do not suit your
+traffic. A single failed request does not trigger anything.
+
+## Commands
+
+| Message | Cause and fix |
+|---|---|
+| `cannot reach the agent at /run/appdeploy/agent.sock` | The agent is not running (`systemctl status appdeployd`) or you cannot use the socket (it is root's, or a group's, see `--socket-group`). Over SSH this appears on the server's side. |
+| `Permission denied (publickey)` | Your key is not in `/home/deploy/.ssh/authorized_keys`; run `install.sh` again with `--ssh-key-file` / `--deployer-key` / `--viewer-key`. |
+| `"deploy" is not allowed for the viewer role` | Your key's role is too low; see [Operations: security](operations.md#security). |
+| `interactive shells are not available` | You ran `ssh deploy@server` without a command. Use `appdeploy --host ...`. |
+| `unexpected option "--host"` | You passed a client option inside an SSH command. |
+| `no such app "x" (create it with: appdeploy apps create x)` | `git push` to an app that does not exist. |
+| `app "x" already exists` | `apps create` of an existing name. |
+| `... is not the deploy branch (main): not deploying` | You pushed another branch. That is by design. |
+| `release vN of x not found (it may have been pruned)` | `rollback --to N` of a release beyond `keep_releases`. |
+| `there is no earlier release to roll back to` | Only one release exists. |
+| `vN is already the current release` | `rollback --to N` of the live release. |
+| `app "x" has nothing deployed yet` | `redeploy` before the first deploy. |
+| `app "x" has a deploy in progress` (apps destroy) | Wait for it. |
+| `docker is not reachable` (agent start) | Docker is not running: `systemctl status docker`. |
+
+## HTTPS and domains
+
+- **No certificate / browser warning:** the domain must resolve to this server and ports 80 and 443
+  must be reachable from the internet. Look at `journalctl -u appdeploy-caddy` for the
+  Let's Encrypt error; wait out rate limits rather than retrying.
+- **`404 no such app`:** the host name is not one of the app's domains (`appdeploy status myapp` shows
+  them), or the app has no release yet.
+- **`502`/connection errors right after a deploy:** check `status`; a container that is not `running`
+  is the cause.
+
+## Groups
+
+| Message | Cause and fix |
+|---|---|
+| `server X is not reachable (...)` | The coordinator cannot reach X's peer port. Start it, fix the firewall, or set `allow_partial: true`. |
+| `server X speaks protocol N and this one M` | The group is in the middle of an update. Wait until `group servers` shows one version. |
+| `no server of the group carries the labels the roles ask for` | `roles.*.on` matches no server's labels. |
+| `services (postgres/redis) are only available when every role runs on the coordinating server` | Use an external `DATABASE_URL` secret instead. |
+| `rollout stopped in wave N` | A server failed in wave N; the ones before it were taken back. The line before says why. |
+| `invalid or expired invite` | Tokens work once for one hour: run `group invite` again. |
+| `the server's CA does not match the invite (wrong server?)` | You are joining a different group than the invite came from. |
+| `only the server that created the group can ...` | `invite`, `remove` and `set-version` only work on the founder. |
+| `waiting for X to update first` (agent log) | The group's update is going one server at a time; it is not stuck. A server that stays on the old version stops the ones behind it. |
+
+## Updates
+
+| Message | Cause and fix |
+|---|---|
+| `... has <repo> published a release?` | The GitHub repository has no release. |
+| `the signature of SHA256SUMS is not valid ... refusing to install` | The release was not signed by the key built into this binary: do not install it. |
+| `this binary was built without a release signing key` | A development build cannot verify updates; install a release binary. |
+| `N deploy(s) are in progress` | Try again later, or `--force`. |
+| `installing X failed here before and was reverted` (agent log) | A group member will not retry a version that failed on it; set another version. |
+
+---
+
+<!-- file: docs/migration.md -->
+
+# Migration
+
+There are no automatic importers yet. Moving is a few manual steps, listed here for the common
+sources, and [leaving appdeploy](#leaving-appdeploy) is one command plus your data.
+
+The model that makes moves cheap: your app is a **Dockerfile**, **environment variables** and
+`GET /up`. Everything else (ports, domains, limits) is a few lines of
+[`appdeploy.yml`](configuration.md).
+
+## Before you move: check the fit
+
+| If your app... | Then |
+|---|---|
+| writes files it must keep (uploads, SQLite) | It does not fit as is: containers have **no persistent volumes**. Move that data to Postgres, object storage, or another service first. |
+| is built with buildpacks (Heroku, Dokku, Fly) and has no Dockerfile | Write a Dockerfile. appdeploy never guesses a build. |
+| needs more than ~10 servers or autoscaling | Not what appdeploy is for. |
+| has background workers or cron | Fine: extra roles (`cmd:`). Run schedules inside a worker process; there is no cron feature. |
+
+A safe way to move any app: set it up on appdeploy **next to** the old deployment (a new server,
+or another port), deploy, test with a temporary domain, move the data, then switch DNS.
+
+## From Kamal
+
+| Kamal (`config/deploy.yml`) | appdeploy |
+|---|---|
+| `service:` | the app name (`apps create <name>`) |
+| `image:` and `registry:` | not needed: the server builds the image. To keep building in CI, `deploy --image` pulls from your registry (`docker login` on the server once). |
+| `servers:` `web:` hosts | servers labeled `web` (one server needs no labels) |
+| `servers:` other roles (`job:` with `cmd:`) | `roles.<name>` with `cmd:` and `on: [label]` |
+| `proxy: host / hosts, ssl` | `domains:` (HTTPS is automatic) |
+| `proxy: app_port` | `roles.web.port` |
+| `proxy: healthcheck: path` | `roles.web.healthcheck.path` |
+| `env: clear:` | set as secrets (`secrets set`), or `ENV` lines in the Dockerfile |
+| `env: secret:` and `.kamal/secrets` | `appdeploy secrets set <app> NAME=value...` |
+| `accessories:` postgres / redis | `services: {postgres: true}` (a database per app, backups) or keep your own and set `DATABASE_URL` |
+| `accessories:` anything else | run it yourself next to appdeploy, or keep it on Kamal |
+| `volumes:` | not supported (see above) |
+| `hooks/pre-deploy` (migrations) | `release_command:` |
+| `builder:` options | not needed (build happens on the server) |
+| `kamal deploy` | `git push prod main` (or `appdeploy deploy`) |
+| `kamal rollback <version>` | `appdeploy rollback <app> [--to N]` |
+| `kamal app logs`, `kamal app exec` | `appdeploy logs`, `appdeploy exec` |
+
+Steps: install appdeploy on a **new** server, create the app with its domain(s), `secrets set`
+the values from `.kamal/secrets`, push, check with a test request (`curl --resolve
+myapp.example.com:443:<new-ip> https://myapp.example.com/up`), copy the database
+([below](#moving-a-postgres-database-in)), lower the DNS TTL, switch DNS, and keep Kamal running
+until traffic has moved. To do it on the **same** server, Kamal's proxy and appdeploy's Caddy both
+want ports 80 and 443: expect a short gap while you stop Kamal's proxy and start appdeploy's.
+
+## From Docker Compose
+
+| Compose | appdeploy |
+|---|---|
+| a service that serves HTTP | the `web` role; `ports:` becomes `domains:` and `roles.web.port` |
+| other services running your image with another `command:` | roles with `cmd:` |
+| `environment:`, `env_file:` | `secrets set` (or `ENV` in the Dockerfile for non-secret defaults) |
+| `build:` | the Dockerfile (and `build.context`, `build.args`) |
+| `mem_limit`, `cpus` | `roles.<name>.memory`, `.cpus` |
+| `healthcheck:` | `roles.web.healthcheck` (an HTTP path, probed from outside) |
+| `postgres`, `redis` services | `services:` (or keep them elsewhere with `DATABASE_URL`) |
+| `volumes:` for your app | not supported |
+| a reverse proxy service (Caddy, Traefik, nginx) | not needed: Caddy is built in |
+
+Put the repository's Dockerfile at the root, write `appdeploy.yml` from the table, push.
+
+## From Dokku or Heroku
+
+| Dokku / Heroku | appdeploy |
+|---|---|
+| `git push dokku main` | `git push prod main` |
+| buildpack (`heroku/nodejs`, ...) | a Dockerfile (required) |
+| `Procfile` entries (`web:`, `worker:`) | roles: `web` runs the image's default `CMD`; others use `cmd:` |
+| `release:` in the Procfile | `release_command:` |
+| `config:set KEY=value` | `secrets set` |
+| `domains:add` | `apps create --domain` / `domains set` |
+| `ps:scale web=2` | `roles.web.replicas_per_server: 2` |
+| `CHECKS` / health check settings | `roles.web.healthcheck` |
+| `postgres:create`, `redis:create` plugins | `services:` |
+| `storage:mount` | not supported |
+| Let's Encrypt plugin | built in |
+
+## From Fly.io, Render, Railway
+
+| Hosted platform | appdeploy |
+|---|---|
+| `fly.toml` `[http_service] internal_port` | `roles.web.port` |
+| `[[http_service.checks]] path` | `roles.web.healthcheck.path` |
+| `[processes]` | roles (`cmd:`) |
+| `[vm] memory` | `roles.<name>.memory` |
+| `fly secrets set`, dashboard env vars | `secrets set` |
+| `[mounts]` volumes | not supported |
+| managed Postgres | keep it and set `DATABASE_URL`, or `services: {postgres: true}` and restore a dump |
+| `fly deploy` | `git push prod main` |
+| certificates | automatic |
+
+## Moving a Postgres database in
+
+Take a plain SQL dump from the old database that does not depend on its users:
+
+```bash
+pg_dump --clean --if-exists --no-owner --no-acl "$OLD_DATABASE_URL" | gzip > import.sql.gz
+```
+
+With `services: {postgres: true}` deployed once (so the app's database exists), copy the dump into
+the app's backup directory on the server and restore it:
+
+```bash
+ssh root@my-server mkdir -p /var/lib/appdeploy/backups/myapp
+scp import.sql.gz root@my-server:/var/lib/appdeploy/backups/myapp/
+appdeploy --host deploy@my-server db restore myapp import.sql.gz
+```
+
+`restore` replaces the tables of the app's database with the dump's, so do it once, before you
+switch traffic (or put the app in a quiet state first). The dump is a plain SQL file replayed
+with `psql`; appdeploy's own backups are exactly that format, which is what has been tested.
+Stop writes to the old database and take a final dump right before the cutover.
+
+## Leaving appdeploy
+
+Everything appdeploy knows can be written for another tool, and nothing appdeploy-specific is
+inside your image or code.
+
+**1. Generate the target's files**, from the live app:
+
+```bash
+appdeploy --host deploy@my-server export myapp --format kamal   --out ./deploy-kamal
+appdeploy --host deploy@my-server export myapp --format compose --out ./deploy-compose
+appdeploy --host deploy@my-server export myapp --format k8s     --out ./deploy-k8s
+appdeploy --host deploy@my-server export myapp --format fly     --out ./deploy-fly
+```
+
+You get roles, ports, limits, health path, domains and the **names** of secrets, with notes where
+you need to decide something (a registry name, the database). Values are never in these files.
+
+| Format | Files | Maps |
+|---|---|---|
+| `kamal` | `config/deploy.yml`, `.kamal/secrets` | roles to Kamal roles with your servers by label, domains to `proxy`, Postgres/Redis to accessories |
+| `compose` | `compose.yml`, `.env.example`, `Caddyfile` | a service per role with limits, Postgres/Redis services, Caddy for the domains |
+| `k8s` | `k8s.yml` | a Secret template, a Deployment per role, a Service and an Ingress |
+| `fly` | `fly.toml`, `secrets.sh` | processes, health check, VM size, a script that sets the secrets |
+
+**2. Get the image into a registry.** appdeploy builds images on the servers and does not push
+them. The image of release N is `ad/<app>:vN` on the server. Either build from your repository in
+the new system, or push what is running:
+
+```bash
+ssh root@my-server
+docker tag ad/myapp:v7 registry.example.com/myapp:v7
+docker push registry.example.com/myapp:v7
+```
+
+The exported files use the placeholder `your-registry.example.com/myapp:vN`; replace it.
+
+**3. Take your secrets and your data:**
+
+```bash
+appdeploy --host deploy@my-server secrets export myapp > myapp.env      # contains values: protect it
+appdeploy --host deploy@my-server db backup myapp                        # then copy it off the server
+scp root@my-server:/var/lib/appdeploy/backups/myapp/<name>.sql.gz .
+gunzip -c <name>.sql.gz | psql "$NEW_DATABASE_URL"
+```
+
+Redis data is not backed up by appdeploy; if you use it for more than a cache, take a dump from
+the Redis container yourself.
+
+**4. Take the source:** the repository on the server is an ordinary bare git repository:
+`git clone deploy@my-server:myapp` works, and `git remote` on your side is all you need.
+
+**5. Switch DNS** once the new system serves the app, then run `appdeploy apps destroy myapp`
+(keeping the database until you are sure) and [uninstall](operations.md#uninstalling).
+
+**What does not carry over:** deploy history and the journal, TLS certificates (the new system
+requests its own), and anything your app kept on the server outside Postgres (it could not keep
+anything, which is why leaving is easy).
+
+---
+
+<!-- file: docs/comparison.md -->
+
+# Comparison: when to choose appdeploy
+
+appdeploy is for people who run **a handful of web apps on one to ten servers they control** and
+want deploys that are boring: `git push`, a safe switch, an automatic way back. Below, how it
+differs from the tools you are likely to be weighing. We describe the other tools as we
+understand them at the time of writing; check their documentation before deciding.
+
+## The short version
+
+| | appdeploy | Kamal | Dokku | Coolify / Dokploy | Fly.io, Render, Railway | Compose + SSH scripts | Kubernetes |
+|---|---|---|---|---|---|---|---|
+| Who drives a deploy | agent on the server | your machine or CI, over SSH | server (git hook) | server, via web UI | their platform | your script | the cluster |
+| Survives your connection dropping mid-deploy | yes, and resumes after crashes | the client drives it, so no | server-side, but check | yes | yes | no | yes |
+| Needs a container registry | no | yes (can be a local one) | no | optional | built in | optional | yes |
+| Automatic rollback on bad traffic | **yes** (5xx, restarts, health) | no (health check at deploy) | no | no | varies | no | not by default |
+| Multiple servers | small groups, canary, labels | yes, by role/host | one host; other schedulers via plugins | yes | their regions | by hand | yes, at any scale |
+| Needs a Dockerfile | yes | yes | no (buildpacks too) | no (buildpacks too) | no | yes | yes |
+| Persistent volumes for the app | **no** | yes | yes | yes | yes | yes | yes |
+| Web UI | no | no | no (CLI) | **yes** | yes | no | dashboards |
+| Where it runs | your Linux servers | your Linux servers | your Linux server | your Linux servers | their servers | yours | yours or managed |
+| Leaving | `export` to Kamal, Compose, k8s, Fly | n/a | n/a | n/a | n/a | n/a | n/a |
+
+## What appdeploy does differently
+
+**The server drives the deploy.** In a tool where your laptop or CI sequences SSH commands, an
+interrupted session can leave a server half-way and a lock behind. In appdeploy your terminal only
+watches: the agent writes every step to a journal before running it, finishes after you disconnect,
+and finishes or reverts after its own crash.
+
+**It watches the release after the switch.** Health checks before the switch catch apps that do not
+start; they do not catch an app that starts and then fails on real requests. appdeploy keeps the old
+release running for a few minutes (default 3) and puts traffic back by itself if the new one
+produces too many 5xx answers, crashes, or stops answering. Rolling back is a single proxy change.
+
+**No registry, no cross-compiling.** The image is built where it runs (or on a build server) and
+copied directly to the other servers. Nothing to host, no credentials to distribute, no `arm64` Mac
+building `amd64` images.
+
+**Small groups without a cluster.** Put roles on servers by label; a deploy builds once, goes to
+one server first, and a failure undoes the servers already switched. A server that was down catches
+up when it returns. Updating appdeploy itself on all servers is one command, in order, with automatic
+revert.
+
+**Open at the edges.** Your app needs a Dockerfile, environment variables and `GET /up`; nothing
+appdeploy-specific is inside your image. `appdeploy export` renders the live setup for Kamal,
+Compose, Kubernetes or Fly. See [Migration](migration.md).
+
+## Compared one by one
+
+**Kamal.** The closest cousin: both deploy Docker images to your servers with a proxy doing zero
+downtime switches. Kamal is mature, has a large user base, supports accessories and hooks, handles any
+number of servers, and keeps the conductor on your side. Choose Kamal if you already use it, need
+volumes, hooks or many servers. Choose appdeploy if you want the server to own the deploy, want
+rollbacks driven by traffic, and do not want a registry. The two are close enough that
+[migrating between them](migration.md) is mostly renaming.
+
+**Dokku.** A self-hosted Heroku on one server: `git push`, buildpacks or a Dockerfile, plugins for
+databases, Let's Encrypt, persistent storage. It is the most similar to appdeploy's workflow and
+far more mature, with a large plugin ecosystem. Choose Dokku if you want buildpacks, storage mounts
+or plugins. Choose appdeploy if you want automatic rollback, a journaled deploy that survives
+crashes, or more than one server.
+
+**Coolify, Dokploy and similar.** Self-hosted platforms with a web UI, templates for many databases
+and services, and multi-server support. Choose them if you want a dashboard, a catalogue of
+one-click services, or a team that prefers clicking. appdeploy has no UI and does one thing: ship
+and run your web apps safely, from the command line and git.
+
+**Fly.io, Render, Railway and other hosted platforms.** Someone else runs the servers; you pay for
+that and accept their limits and prices. Choose them if you do not want to operate servers at all.
+appdeploy is for when you do (cost, data location, control) and want that to be pleasant.
+
+**Docker Compose with SSH scripts.** Fine for one app, until you need the switch without downtime,
+rollbacks, secrets per release, TLS and multiple apps; those are what appdeploy adds, and `export`
+will give you a Compose file back if you leave.
+
+**Kubernetes.** The right answer at a scale or complexity appdeploy deliberately does not aim at:
+dozens of services, autoscaling, many teams, stateful workloads. Below that it is a lot to run.
+
+## What appdeploy does not do
+
+Be sure none of these is a deal breaker before you adopt it:
+
+- **No persistent volumes for your app.** Containers are stateless. Persistent data has to live
+  in Postgres or Redis (appdeploy can run both for you, with backups) or an external service.
+  Apps that write files they need to keep do not fit yet.
+- **No buildpacks.** You provide a Dockerfile.
+- **Linux servers and Docker only.** The install script targets Debian and Ubuntu with systemd.
+- **No web UI** and no multi-user accounts beyond SSH key roles.
+- **Not for large fleets.** Up to about ten servers; no scheduler, no autoscaling, no load
+  balancer (you bring one, or DNS).
+- **Backups stay on the server** unless you copy them; there is no built-in off-site backup.
+- **Young.** Version 0.1: thoroughly tested by its own end-to-end suite against real Docker and
+  Caddy, but not yet proven in production, and the install script has not been run on a real server
+  by its authors. Pin your expectations accordingly, and keep the exit door in mind: `appdeploy export`.

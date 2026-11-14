@@ -1,0 +1,31 @@
+# appdeploy
+
+> appdeploy deploys Docker-based web apps to your own Linux servers with `git push`. A small agent on each server builds the Dockerfile, starts the new version next to the old one, verifies it, switches traffic, watches real traffic and rolls back automatically on errors. It resumes after crashes, needs no registry, supports small server groups, and can export its setup to Kamal, Docker Compose, Kubernetes and Fly.
+
+Key facts for an assistant: a deploy is run by the server's agent, not the terminal; `git push` always exits 0 so success is the line `==> succeeded` (or `appdeploy deploy` exiting 0); apps are stateless (no volumes) and need a Dockerfile; a failed deploy leaves the old release serving; ask the person before destructive or secret-revealing commands. Read the guide for assistants first.
+
+## Start here
+
+- [Guide for AI assistants and agents](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/llm-guide.md): rules, command safety table, recipes, how to read output
+- [README](https://raw.githubusercontent.com/merkushin/appdeploy/main/README.md): what it is and why
+- [Getting started](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/getting-started.md): install and first deploy
+
+## Reference
+
+- [Commands](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/commands.md): every CLI command, roles, exit status
+- [Configuration](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/configuration.md): appdeploy.yml keys, agent flags, files on disk
+- [HTTP API](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/api.md): the agent's JSON API on a unix socket
+- [Concepts](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/concepts.md): deploy states, releases, the watchdog
+
+## Guides
+
+- [Server groups](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/groups.md): several servers, labels, build servers, updating a group
+- [Operations](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/operations.md): CI, secrets, backups, notifications, security, updates
+- [Troubleshooting](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/troubleshooting.md): error messages and fixes
+- [Migration](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/migration.md): from Kamal, Compose, Dokku, Fly; leaving appdeploy
+- [Comparison](https://raw.githubusercontent.com/merkushin/appdeploy/main/docs/comparison.md): when to choose appdeploy, and what it does not do
+
+## Optional
+
+- [Full documentation in one file](https://raw.githubusercontent.com/merkushin/appdeploy/main/llms-full.txt): everything above, concatenated
+- [Design document](https://raw.githubusercontent.com/merkushin/appdeploy/main/SPEC.md): the design and what is implemented
