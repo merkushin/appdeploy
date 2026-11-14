@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	pathpkg "path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,10 +39,16 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("invalid duration %q", s)
+		return typeError(n, fmt.Sprintf("invalid duration %q", s))
 	}
 	*d = Duration(v)
 	return nil
+}
+
+// typeError reports a bad value as a yaml.TypeError, which the decoder collects
+// instead of stopping at: a file with several mistakes shows all of them at once.
+func typeError(n *yaml.Node, msg string) error {
+	return &yaml.TypeError{Errors: []string{fmt.Sprintf("line %d: %s", n.Line, msg)}}
 }
 
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
@@ -86,7 +94,7 @@ func (z *Size) UnmarshalYAML(n *yaml.Node) error {
 	}
 	v, err := ParseSize(s)
 	if err != nil {
-		return err
+		return typeError(n, err.Error())
 	}
 	*z = v
 	return nil
@@ -116,6 +124,7 @@ type Role struct {
 	Healthcheck    Healthcheck `yaml:"healthcheck" json:"healthcheck"`
 	Smoke          []string    `yaml:"smoke" json:"smoke,omitempty"`
 	StopTimeout    Duration    `yaml:"stop_timeout" json:"stop_timeout"`
+	Volumes        []string    `yaml:"volumes" json:"volumes,omitempty"` // "name:/path[:ro]", named volumes only
 }
 
 type Services struct {
@@ -131,17 +140,18 @@ type Watch struct {
 }
 
 type App struct {
-	App            string           `yaml:"app" json:"app"`
-	Branch         string           `yaml:"branch" json:"branch"`
-	Build          Build            `yaml:"build" json:"build"`
-	Domains        []string         `yaml:"domains" json:"domains,omitempty"`
-	Roles          map[string]*Role `yaml:"roles" json:"roles"`
-	ReleaseCommand string           `yaml:"release_command" json:"release_command,omitempty"`
-	Services       Services         `yaml:"services" json:"services"`
-	Watch          Watch            `yaml:"watch" json:"watch"`
-	AllowPartial   bool             `yaml:"allow_partial" json:"allow_partial,omitempty"`
-	KeepReleases   int              `yaml:"keep_releases" json:"keep_releases"`
-	Notify         []string         `yaml:"notify" json:"notify,omitempty"`
+	App            string            `yaml:"app" json:"app"`
+	Branch         string            `yaml:"branch" json:"branch"`
+	Build          Build             `yaml:"build" json:"build"`
+	Domains        []string          `yaml:"domains" json:"domains,omitempty"`
+	Roles          map[string]*Role  `yaml:"roles" json:"roles"`
+	Env            map[string]string `yaml:"env" json:"env,omitempty"` // not secret: kept in git and in the release
+	ReleaseCommand string            `yaml:"release_command" json:"release_command,omitempty"`
+	Services       Services          `yaml:"services" json:"services"`
+	Watch          Watch             `yaml:"watch" json:"watch"`
+	AllowPartial   bool              `yaml:"allow_partial" json:"allow_partial,omitempty"`
+	KeepReleases   int               `yaml:"keep_releases" json:"keep_releases"`
+	Notify         []string          `yaml:"notify" json:"notify,omitempty"`
 }
 
 // Default returns the configuration of a repository that has no appdeploy.yml.
@@ -275,6 +285,18 @@ func (a *App) Validate() error {
 	if len(a.Roles) == 0 {
 		return errors.New("roles: at least one role is required")
 	}
+	for k, v := range a.Env {
+		switch {
+		case !envKeyRe.MatchString(k):
+			return fmt.Errorf("env.%s: not a valid variable name (letters, digits and underscores, not starting with a digit)", k)
+		case k == "PORT":
+			return errors.New("env.PORT: the port is set by roles.web.port; appdeploy passes it as PORT")
+		case strings.HasPrefix(k, "APPDEPLOY_"):
+			return fmt.Errorf("env.%s: names starting with APPDEPLOY_ are set by appdeploy", k)
+		case strings.ContainsAny(v, "\r\n"):
+			return fmt.Errorf("env.%s: a value must be a single line", k)
+		}
+	}
 	for name, r := range a.Roles {
 		if !roleNameRe.MatchString(name) {
 			return fmt.Errorf("roles.%s: invalid role name", name)
@@ -299,9 +321,82 @@ func (a *App) Validate() error {
 				return fmt.Errorf("roles.%s.smoke: %q must be a path starting with /", name, u)
 			}
 		}
+		paths := map[string]bool{}
+		for _, v := range r.Volumes {
+			_, path, _, err := ParseVolume(v)
+			if err != nil {
+				return fmt.Errorf("roles.%s.volumes: %w", name, err)
+			}
+			if paths[path] {
+				return fmt.Errorf("roles.%s.volumes: two volumes are mounted at %s", name, path)
+			}
+			paths[path] = true
+		}
 	}
 	return nil
 }
 
 // WebRole returns the HTTP role, or nil if the app has none.
 func (a *App) WebRole() *Role { return a.Roles["web"] }
+
+var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+var volumeNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+
+// ParseVolume reads "name:/path" or "name:/path:ro". Only named volumes are
+// accepted: a host path would let a config reach files of the server.
+func ParseVolume(s string) (name, path string, readOnly bool, err error) {
+	parts := strings.Split(s, ":")
+	if len(parts) == 3 && parts[2] == "ro" {
+		readOnly = true
+		parts = parts[:2]
+	}
+	if len(parts) != 2 {
+		return "", "", false, fmt.Errorf("%q: use name:/path or name:/path:ro", s)
+	}
+	name, path = parts[0], parts[1]
+	if !volumeNameRe.MatchString(name) {
+		return "", "", false, fmt.Errorf("%q: the volume name must be lowercase letters, digits, - and _ (host paths are not allowed: use a named volume)", s)
+	}
+	clean := pathpkg.Clean(path)
+	if !strings.HasPrefix(path, "/") || clean != path || path == "/" {
+		return "", "", false, fmt.Errorf("%q: the mount path must be an absolute, clean path other than /", s)
+	}
+	for _, bad := range []string{"/proc", "/sys", "/dev"} {
+		if path == bad || strings.HasPrefix(path, bad+"/") {
+			return "", "", false, fmt.Errorf("%q: %s cannot be mounted over", s, bad)
+		}
+	}
+	return name, path, readOnly, nil
+}
+
+var secretish = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|SECRET|TOKEN|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY|(^|_)KEY$)`)
+
+// Warnings lists things that are valid but probably not what was meant.
+func (a *App) Warnings() []string {
+	var w []string
+	keys := make([]string, 0, len(a.Env))
+	for k := range a.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if secretish.MatchString(k) {
+			w = append(w, fmt.Sprintf("env.%s looks like a secret: values in appdeploy.yml are kept in git. Use `appdeploy secrets set` for secrets", k))
+		}
+	}
+	names := make([]string, 0, len(a.Roles))
+	for n := range a.Roles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		r := a.Roles[n]
+		for _, v := range r.Volumes {
+			if _, _, ro, _ := ParseVolume(v); !ro && r.ReplicasPerSrv > 1 {
+				w = append(w, fmt.Sprintf("roles.%s: %d replicas per server share the volume in %q; that is only safe for data that tolerates several writers (not SQLite or similar)", n, r.ReplicasPerSrv, v))
+			}
+		}
+	}
+	return w
+}

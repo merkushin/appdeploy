@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/netip"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -546,6 +547,51 @@ func (c *Client) ContainerRunning(ctx context.Context, name string) (exists, run
 func (c *Client) StartContainer(ctx context.Context, name string) error {
 	_, err := c.run(ctx, "start", name)
 	return err
+}
+
+// EnsureVolume creates a named volume with labels if it does not exist yet.
+func (c *Client) EnsureVolume(ctx context.Context, name string, labels map[string]string) error {
+	if _, err := c.run(ctx, "volume", "inspect", name); err == nil {
+		return nil
+	}
+	args := []string{"volume", "create"}
+	for k, v := range labels {
+		args = append(args, "--label", k+"="+v)
+	}
+	_, err := c.run(ctx, append(args, name)...)
+	return err
+}
+
+// ListVolumes returns the names of the volumes that carry all of the labels (key=value).
+func (c *Client) ListVolumes(ctx context.Context, labels ...string) ([]string, error) {
+	args := []string{"volume", "ls", "-q"}
+	for _, l := range labels {
+		args = append(args, "--filter", "label="+l)
+	}
+	s, err := c.run(ctx, args...)
+	if err != nil || s == "" {
+		return nil, err
+	}
+	return strings.Fields(s), nil
+}
+
+// ImageVolumes returns the paths the image declares with VOLUME, which Docker
+// would back with an anonymous volume that does not outlive the container.
+func (c *Client) ImageVolumes(ctx context.Context, image string) ([]string, error) {
+	s, err := c.run(ctx, "image", "inspect", "--format", "{{json .Config.Volumes}}", image)
+	if err != nil || s == "" || s == "null" {
+		return nil, err
+	}
+	var m map[string]struct{}
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil, err
+	}
+	var out []string
+	for p := range m {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // RemoveVolume removes a named volume. A missing volume is not an error.

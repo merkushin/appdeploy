@@ -1094,3 +1094,120 @@ func TestCrashedContainerIsReported(t *testing.T) {
 		t.Errorf("%d alerts for one crash, want 1", n)
 	}
 }
+
+// --json: reading commands print JSON, a deploy prints one JSON line per journal
+// entry ending with the verdict, errors are JSON too, and it all works over the
+// SSH entry point for every role.
+func TestJSONOutput(t *testing.T) {
+	e := env
+	e.newApp(t, "js", "js.test")
+	r := e.newRepo(t, "hello")
+	if out, err := r.push("js"); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+
+	decode := func(args ...string) map[string]any {
+		t.Helper()
+		out, err := e.ad(append(args, "--json")...)
+		if err != nil {
+			t.Fatalf("%v --json: %v\n%s", args, err, out)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("%v --json is not one JSON object: %v\n%s", args, err, out)
+		}
+		return m
+	}
+	st := decode("status", "js")
+	if app, _ := st["app"].(map[string]any); app["name"] != "js" || app["current_release"] != float64(1) {
+		t.Errorf("status: %v", st)
+	}
+	if cs, _ := st["containers"].([]any); len(cs) != 1 {
+		t.Errorf("status containers: %v", st["containers"])
+	}
+	var list []map[string]any
+	out := e.mustAd(t, "--json", "apps", "list")
+	if err := json.Unmarshal([]byte(out), &list); err != nil || len(list) == 0 {
+		t.Errorf("apps list: %v\n%s", err, out)
+	}
+	if names := decode("secrets", "list", "js")["names"]; names == nil {
+		t.Errorf("secrets list has no names array")
+	}
+	if p := decode("ping"); p["ok"] != true {
+		t.Errorf("ping: %v", p)
+	}
+
+	// A deploy streams one JSON object per line; the last says how it ended.
+	r.write("message.txt", "hello json\n")
+	r.commit("json")
+	if out, err := r.push("js"); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	lines := strings.Split(e.mustAd(t, "redeploy", "js", "--json"), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("a redeploy printed %d lines", len(lines))
+	}
+	for _, l := range lines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("a line of the stream is not JSON: %q", l)
+		}
+	}
+	var last map[string]any
+	_ = json.Unmarshal([]byte(lines[len(lines)-1]), &last)
+	if last["done"] != true || last["state"] != "succeeded" {
+		t.Errorf("the last line is %v", last)
+	}
+	if _, has := last["time"]; has {
+		t.Errorf("the verdict line carries a time: %v", last)
+	}
+
+	// A deploy that fails exits 1 and says so on its last line, once.
+	r.write("appdeploy.yml", "roles:\n  web:\n    healthcheck:\n      path: /nope\n      start_period: 3s\n")
+	r.commit("bad")
+	r.push("js")
+	out, err := e.ad("deploy", "js", "--json")
+	if err == nil {
+		t.Fatalf("a failing deploy exited 0:\n%s", out)
+	}
+	ls := strings.Split(out, "\n")
+	_ = json.Unmarshal([]byte(ls[len(ls)-1]), &last)
+	if last["done"] != true || last["state"] != "failed" || !strings.Contains(fmt.Sprint(last["error"]), "did not pass") {
+		t.Errorf("the failing deploy's last line: %v", last)
+	}
+	if strings.Count(out, `"error"`) != 1 {
+		t.Errorf("the failure was reported more than once:\n%s", out[len(out)-400:])
+	}
+
+	// Errors are JSON on stdout, and a usage error exits 2.
+	out, err = e.ad("status", "nosuchapp", "--json")
+	if err == nil || !strings.Contains(out, `{"error":`) {
+		t.Errorf("an error in JSON mode: %v %q", err, out)
+	}
+	if _, err := e.ad("deploy"); err == nil {
+		t.Errorf("deploy without an app succeeded")
+	}
+	if ee, ok := func() (*exec.ExitError, bool) {
+		cmd := exec.Command(e.bin, "--socket", e.socket, "deploy")
+		err := cmd.Run()
+		x, ok := err.(*exec.ExitError)
+		return x, ok
+	}(); !ok || ee.ExitCode() != 2 {
+		t.Errorf("a usage error should exit 2, got %v", ee)
+	}
+
+	// Through the SSH entry point, a viewer can ask for JSON too.
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ssh")
+	script := fmt.Sprintf("#!/bin/sh\nfor last; do :; done\nexport SSH_ORIGINAL_COMMAND=\"$last\" APPDEPLOY_SOCKET=%q APPDEPLOY_DATA_DIR=%q\nexec %q shell --role viewer\n", e.socket, e.dataDir, e.bin)
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cli := exec.Command(e.bin, "--host", "viewer@testhost", "--json", "status", "js")
+	cli.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+	b, err := cli.CombinedOutput()
+	var viaSSH map[string]any
+	if err != nil || json.Unmarshal(b, &viaSSH) != nil || viaSSH["app"] == nil {
+		t.Errorf("--json over ssh: %v\n%s", err, b)
+	}
+}

@@ -484,6 +484,10 @@ func cleanupInstance(instance string) {
 	if tags, _ := sh("docker", "images", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference="+instance+"/*"); tags != "" {
 		_, _ = sh("docker", append([]string{"rmi", "-f"}, strings.Fields(tags)...)...)
 	}
+	// Volumes of apps (labeled) and of the Postgres/Redis services (named <instance>-svc-*).
+	if vols, _ := sh("docker", "volume", "ls", "-q", "--filter", "label=appdeploy.instance="+instance); vols != "" {
+		_, _ = sh("docker", append([]string{"volume", "rm", "-f"}, strings.Fields(vols)...)...)
+	}
 	// Volumes of the Postgres/Redis services (named <instance>-svc-*).
 	if vols, _ := sh("docker", "volume", "ls", "-q", "--filter", "name="+instance+"-svc"); vols != "" {
 		_, _ = sh("docker", append([]string{"volume", "rm", "-f"}, strings.Fields(vols)...)...)
@@ -518,4 +522,14 @@ func (e *testEnv) buildBinary(path, version string, extraLdflags ...string) (str
 	pub := base64.StdEncoding.EncodeToString(e.updKey.Public().(ed25519.PublicKey))
 	ldflags := strings.Join(append([]string{fmt.Sprintf("-X main.version=%s -X main.updatePublicKey=%s -X main.updateRepo=acme/tool", version, pub)}, extraLdflags...), " ")
 	return sh("go", "build", "-ldflags", ldflags, "-o", path, filepath.Join(e.repoRoot, "cmd", "appdeploy"))
+}
+
+// read returns the content of a file of the repository.
+func (r *repo) read(name string) string {
+	r.t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.dir, name))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return string(b)
 }

@@ -29,11 +29,33 @@ func k8s(s Spec) map[string]string {
 				fmt.Fprintf(&b, "            - %s\n", q(a))
 			}
 		}
+		if env := plainEnv(c); name == "web" || len(env) > 0 {
+			b.WriteString("          env:\n")
+			for _, kv := range env {
+				fmt.Fprintf(&b, "            - {name: %s, value: %s}\n", q(kv[0]), q(kv[1]))
+			}
+			if name == "web" {
+				fmt.Fprintf(&b, "            - {name: PORT, value: %q}\n", fmt.Sprint(webPort(c)))
+			}
+		}
 		if name == "web" {
-			fmt.Fprintf(&b, "          env:\n            - {name: PORT, value: %q}\n          ports:\n            - containerPort: %d\n          readinessProbe:\n            httpGet: {path: %s, port: %d}\n            periodSeconds: 5\n            timeoutSeconds: %d\n",
-				fmt.Sprint(webPort(c)), webPort(c), q(r.Healthcheck.Path), webPort(c), int(r.Healthcheck.Timeout.D().Seconds()))
+			fmt.Fprintf(&b, "          ports:\n            - containerPort: %d\n          readinessProbe:\n            httpGet: {path: %s, port: %d}\n            periodSeconds: 5\n            timeoutSeconds: %d\n",
+				webPort(c), q(r.Healthcheck.Path), webPort(c), int(r.Healthcheck.Timeout.D().Seconds()))
 		}
 		fmt.Fprintf(&b, "          resources:\n            limits: {memory: %s, cpu: %q}\n", q(mem(r)+"i"), fmt.Sprint(r.CPUs))
+		if ms := mountsOf(r); len(ms) > 0 {
+			b.WriteString("          volumeMounts:\n")
+			for _, m := range ms {
+				fmt.Fprintf(&b, "            - {name: %s, mountPath: %s, readOnly: %v}\n", q(m.Name), q(m.Path), m.RO)
+			}
+			b.WriteString("      volumes:\n")
+			for _, m := range ms {
+				fmt.Fprintf(&b, "        - name: %s\n          persistentVolumeClaim: {claimName: %s}\n", q(m.Name), q(s.App+"-"+m.Name))
+			}
+		}
+	}
+	for _, v := range volumeNames(c) {
+		fmt.Fprintf(&b, "---\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: %s\nspec:\n  accessModes: [ReadWriteOnce]   # one node at a time; with several replicas use a ReadWriteMany class\n  resources:\n    requests: {storage: 1Gi}      # set the size you need\n", q(s.App+"-"+v))
 	}
 	if c.Roles["web"] != nil {
 		fmt.Fprintf(&b, "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: %s\nspec:\n  selector: {app: %s, role: web}\n  ports:\n    - port: 80\n      targetPort: %d\n", q(s.App), q(s.App), webPort(c))

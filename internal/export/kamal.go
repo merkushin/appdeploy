@@ -35,10 +35,35 @@ func kamal(s Spec) map[string]string {
 		}
 		fmt.Fprintf(&b, "  app_port: %d\n  healthcheck:\n    path: %s\n", webPort(c), q(web.Healthcheck.Path))
 	}
-	if names := allEnvNames(s); len(names) > 0 {
-		b.WriteString("\nenv:\n  secret:\n")
-		for _, n := range names {
-			fmt.Fprintf(&b, "    - %s\n", n)
+	if names, plain := allEnvNames(s), plainEnv(c); len(names) > 0 || len(plain) > 0 {
+		b.WriteString("\nenv:\n")
+		if len(plain) > 0 {
+			b.WriteString("  clear:\n")
+			for _, kv := range plain {
+				fmt.Fprintf(&b, "    %s: %s\n", kv[0], q(kv[1]))
+			}
+		}
+		if len(names) > 0 {
+			b.WriteString("  secret:\n")
+			for _, n := range names {
+				fmt.Fprintf(&b, "    - %s\n", n)
+			}
+		}
+	}
+	if vols := volumeNames(c); len(vols) > 0 {
+		b.WriteString("\nvolumes:\n")
+		seen := map[string]bool{}
+		for _, role := range sortedRoles(c) {
+			for _, m := range mountsOf(c.Roles[role]) {
+				line := fmt.Sprintf("%s_%s:%s", s.App, m.Name, m.Path)
+				if m.RO {
+					line += ":ro"
+				}
+				if !seen[line] {
+					seen[line] = true
+					fmt.Fprintf(&b, "  - %s\n", q(line))
+				}
+			}
 		}
 	}
 	if c.Services.Postgres || c.Services.Redis {

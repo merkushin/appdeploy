@@ -185,3 +185,52 @@ func TestComposeIsAcceptedByDockerCompose(t *testing.T) {
 		t.Fatalf("docker compose rejected the file: %v\n%s\n%s", err, out, files["compose.yml"])
 	}
 }
+
+func TestEnvAndVolumesAreExported(t *testing.T) {
+	s := spec(t)
+	s.Config.Env = map[string]string{"BASE_URL": "https://shop.example.com", "INVITE_ONLY": "1"}
+	s.Config.Roles["web"].Volumes = []string{"data:/data", "cache:/var/cache:ro"}
+	for format, wants := range map[string][]string{
+		"kamal":   {"clear:", `BASE_URL: "https://shop.example.com"`, `- "shop_data:/data"`, `- "shop_cache:/var/cache:ro"`},
+		"compose": {`BASE_URL: "https://shop.example.com"`, `- "data:/data"`, `- "cache:/var/cache:ro"`, "  data: {}"},
+		"k8s":     {`{name: "BASE_URL", value: "https://shop.example.com"}`, "kind: PersistentVolumeClaim", `claimName: "shop-data"`, `mountPath: "/data"`, "readOnly: true"},
+		"fly":     {`BASE_URL = "https://shop.example.com"`, "[[mounts]]", `source = "shop_data"`, `destination = "/data"`},
+	} {
+		files, err := Render(format, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all := ""
+		for _, c := range files {
+			all += c
+		}
+		for _, want := range wants {
+			if !strings.Contains(all, want) {
+				t.Errorf("%s: missing %q:\n%s", format, want, all)
+			}
+		}
+	}
+	// Still valid for the tools that can check it.
+	files, _ := Render("compose", s)
+	m := decode(t, files["compose.yml"])
+	if get(t, m, "services", "web", "environment", "INVITE_ONLY") != "1" || get(t, m, "volumes", "data") == nil {
+		t.Errorf("compose: %v", m)
+	}
+	kamalFiles, _ := Render("kamal", s)
+	k := decode(t, kamalFiles["config/deploy.yml"])
+	if get(t, k, "env", "clear", "BASE_URL") != "https://shop.example.com" || len(get(t, k, "volumes").([]any)) != 2 {
+		t.Errorf("kamal: %v", k)
+	}
+	for _, doc := range strings.Split(mustFile(t, "k8s", s), "\n---\n") {
+		decode(t, doc) // every document must stay valid YAML
+	}
+}
+
+func mustFile(t *testing.T, format string, s Spec) string {
+	t.Helper()
+	files, err := Render(format, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files["k8s.yml"]
+}

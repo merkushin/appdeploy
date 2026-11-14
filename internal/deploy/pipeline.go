@@ -178,6 +178,9 @@ func (r *run) pipeline() error {
 			return err
 		}
 	}
+	for _, w := range r.cfg.Warnings() {
+		r.logf("warning: %s", w)
+	}
 	r.emit(notify.DeployStarted, "")
 	if err := r.checkResources(); err != nil {
 		return err
@@ -390,9 +393,17 @@ func (r *run) build() error {
 // envFor writes a temporary env file for a container and returns its path.
 func (r *run) envFor(role string, port int) (string, error) {
 	e := r.e
-	env, err := ReadEnvFile(e.snapshotFile(r.d.App, r.d.Release))
+	secrets, err := ReadEnvFile(e.snapshotFile(r.d.App, r.d.Release))
 	if err != nil {
 		return "", err
+	}
+	// Plain environment from appdeploy.yml first; secrets of the same name win.
+	env := map[string]string{}
+	for k, v := range r.cfg.Env {
+		env[k] = v
+	}
+	for k, v := range secrets {
+		env[k] = v
 	}
 	env["APPDEPLOY_APP"] = r.d.App
 	env["APPDEPLOY_RELEASE"] = fmt.Sprint(r.d.Release)
@@ -486,6 +497,9 @@ func (r *run) start() error {
 	if err := e.dk.EnsureNetwork(ctx, e.networkName(r.d.App), map[string]string{"appdeploy.instance": e.opt.Instance}); err != nil {
 		return err
 	}
+	if err := r.prepareVolumes(); err != nil {
+		return err
+	}
 	// Leftovers of an earlier attempt of this release.
 	if old, _ := e.st.ReleaseContainers(r.d.App, r.d.Release); len(old) > 0 {
 		for _, c := range old {
@@ -524,6 +538,7 @@ func (r *run) start() error {
 				Name: name, Image: r.image, Network: e.networkName(r.d.App), EnvFile: envFile,
 				Memory: role.Memory.Bytes(), CPUs: role.CPUs, Cmd: cmd, PublishPort: port,
 				Labels: e.labels(r.d.App, r.d.Release, roleName), StopTimeout: int(role.StopTimeout.D().Seconds()),
+				Volumes: r.mounts(role),
 			})
 			os.Remove(envFile)
 			if err != nil {
@@ -965,5 +980,75 @@ func (r *run) loadImage() error {
 		return err
 	}
 	r.image, r.builtImage, r.sha = tag, true, ref
+	return nil
+}
+
+// volumeName is the Docker name of an app's volume.
+func (e *Engine) volumeName(app, name string) string {
+	return fmt.Sprintf("%s-%s-%s", e.opt.Instance, app, name)
+}
+
+// mounts returns the docker -v arguments of a role.
+func (r *run) mounts(role *config.Role) []string {
+	var out []string
+	for _, v := range role.Volumes {
+		name, path, ro, err := config.ParseVolume(v)
+		if err != nil {
+			continue // validated when the config was read
+		}
+		m := r.e.volumeName(r.d.App, name) + ":" + path
+		if ro {
+			m += ":ro"
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// prepareVolumes creates the volumes this release mounts and refuses to start
+// containers whose image declares a VOLUME that nothing is mounted over: Docker
+// would back it with an anonymous volume that is deleted with the container, so
+// the data written there would be lost at the next deploy.
+func (r *run) prepareVolumes() error {
+	e := r.e
+	ctx := e.ctx
+	declared, err := e.dk.ImageVolumes(ctx, r.image)
+	if err != nil {
+		return err
+	}
+	used := map[string]bool{}
+	for _, roleName := range r.roleNames() {
+		role := r.cfg.Roles[roleName]
+		mounted := map[string]bool{}
+		for _, v := range role.Volumes {
+			name, path, _, err := config.ParseVolume(v)
+			if err != nil {
+				return err
+			}
+			mounted[path] = true
+			used[name] = true
+		}
+		for _, p := range declared {
+			if !mounted[p] {
+				return fmt.Errorf("the image declares VOLUME %s but role %s mounts nothing there, so Docker would use an anonymous volume that is deleted with the container and the data would be lost at the next deploy. Add roles.%s.volumes: [\"data:%s\"] to appdeploy.yml, or remove VOLUME from the Dockerfile", p, roleName, roleName, p)
+			}
+		}
+	}
+	names := make([]string, 0, len(used))
+	for n := range used {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if err := e.dk.EnsureVolume(ctx, e.volumeName(r.d.App, n), map[string]string{
+			"appdeploy.instance": e.opt.Instance, "appdeploy.app": r.d.App, "appdeploy.volume": n,
+		}); err != nil {
+			return fmt.Errorf("creating volume %s: %w", n, err)
+		}
+	}
+	if len(names) > 0 && r.prev != 0 && r.prev != r.d.Release {
+		r.logf("WARNING: volume(s) %s are used by v%d and by v%d at the same time until v%d stops (after the %s watch window). Databases such as SQLite on the volume have two processes on them meanwhile; shorten watch.window if that matters",
+			strings.Join(names, ", "), r.prev, r.d.Release, r.prev, r.cfg.Watch.Window.D())
+	}
 	return nil
 }

@@ -11,6 +11,17 @@ func fly(s Spec) map[string]string {
 	var b bytes.Buffer
 	header(&b, "Fly.io", s)
 	fmt.Fprintf(&b, "app = %s\n# primary_region = \"ams\"\n\n[build]\n  image = %s\n\n[env]\n  PORT = %q\n", q(s.App), q(image(s)), fmt.Sprint(webPort(c)))
+	for _, kv := range plainEnv(c) {
+		fmt.Fprintf(&b, "  %s = %s\n", kv[0], q(kv[1]))
+	}
+	for _, role := range sortedRoles(c) {
+		for _, m := range mountsOf(c.Roles[role]) {
+			fmt.Fprintf(&b, "\n[[mounts]]\n  source = %s\n  destination = %s\n", q(s.App+"_"+m.Name), q(m.Path))
+			if len(sortedRoles(c)) > 1 {
+				fmt.Fprintf(&b, "  processes = [%s]\n", q(role))
+			}
+		}
+	}
 	roles := sortedRoles(c)
 	if len(roles) > 1 {
 		b.WriteString("\n[processes]\n")

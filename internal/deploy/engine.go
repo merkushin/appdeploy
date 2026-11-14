@@ -243,24 +243,24 @@ func (e *Engine) CreateApp(name string, domains []string, branch string) (store.
 }
 
 // RemoveApp stops everything the app runs and deletes its data.
-func (e *Engine) RemoveApp(ctx context.Context, name string) error {
+func (e *Engine) RemoveApp(ctx context.Context, name string, deleteVolumes bool) (kept []string, err error) {
 	if _, err := e.st.GetApp(name); err != nil {
-		return err
+		return nil, err
 	}
 	e.mu.Lock()
 	q := e.queues[name]
 	busy := q != nil && (q.running || q.pending != nil)
 	e.mu.Unlock()
 	if busy {
-		return fmt.Errorf("app %q has a deploy in progress", name)
+		return nil, fmt.Errorf("app %q has a deploy in progress", name)
 	}
 	cs, err := e.st.AppContainers(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, c := range cs {
 		if err := e.dk.Remove(ctx, c.DockerID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	rels, _ := e.st.ListReleases(name)
@@ -268,12 +268,23 @@ func (e *Engine) RemoveApp(ctx context.Context, name string) error {
 		_ = e.dk.RemoveImage(ctx, r.Image)
 	}
 	if err := e.st.DeleteApp(name); err != nil {
-		return err
+		return nil, err
 	}
 	_ = e.dk.RemoveNetwork(ctx, e.networkName(name))
 	_ = os.RemoveAll(e.appDir(name))
 	_ = os.Remove(e.secretsFile(name))
-	return e.ApplyProxy(ctx)
+	// The app's data is the one thing that is kept unless it is asked for.
+	vols, _ := e.dk.ListVolumes(ctx, "appdeploy.instance="+e.opt.Instance, "appdeploy.app="+name)
+	for _, v := range vols {
+		if deleteVolumes {
+			if err := e.dk.RemoveVolume(ctx, v); err != nil {
+				return kept, fmt.Errorf("removing volume %s: %w", v, err)
+			}
+			continue
+		}
+		kept = append(kept, v)
+	}
+	return kept, e.ApplyProxy(ctx)
 }
 
 // SetDomains replaces the app's domains and updates the proxy.

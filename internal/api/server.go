@@ -238,11 +238,15 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteApp(w http.ResponseWriter, r *http.Request) {
-	if err := s.Eng.RemoveApp(r.Context(), r.PathValue("app")); err != nil {
+	kept, err := s.Eng.RemoveApp(r.Context(), r.PathValue("app"), r.URL.Query().Get("volumes") == "1")
+	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	if kept == nil {
+		kept = []string{}
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "kept_volumes": kept})
 }
 
 func (s *Server) setDomains(w http.ResponseWriter, r *http.Request) {
@@ -354,12 +358,12 @@ func (s *Server) getDeploy(w http.ResponseWriter, r *http.Request) {
 
 // EventLine is one line of the deploy event stream. The last line has Done set.
 type EventLine struct {
-	ID    int64     `json:"id,omitempty"`
-	Time  time.Time `json:"time,omitempty"`
-	Msg   string    `json:"msg,omitempty"`
-	Done  bool      `json:"done,omitempty"`
-	State string    `json:"state,omitempty"`
-	Error string    `json:"error,omitempty"`
+	ID    int64      `json:"id,omitempty"`
+	Time  *time.Time `json:"time,omitempty"`
+	Msg   string     `json:"msg,omitempty"`
+	Done  bool       `json:"done,omitempty"`
+	State string     `json:"state,omitempty"`
+	Error string     `json:"error,omitempty"`
 }
 
 // events streams the deploy journal as JSON lines until the deploy ends. The
@@ -386,7 +390,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, e := range evs {
 			after = e.ID
-			if err := enc.Encode(EventLine{ID: e.ID, Time: e.Time, Msg: e.Msg}); err != nil {
+			if err := enc.Encode(EventLine{ID: e.ID, Time: &e.Time, Msg: e.Msg}); err != nil {
 				return
 			}
 		}

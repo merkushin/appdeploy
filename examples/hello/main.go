@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -52,6 +53,26 @@ func serve() {
 	mux.HandleFunc("/up", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, os.Getenv(r.URL.Query().Get("name")))
+	})
+	// /write?file=a&v=text and /read?file=a use $DATA_DIR (default /data): a volume in the tests.
+	dir := os.Getenv("DATA_DIR")
+	if dir == "" {
+		dir = "/data"
+	}
+	mux.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
+		if err := os.WriteFile(filepath.Join(dir, filepath.Base(r.URL.Query().Get("file"))), []byte(r.URL.Query().Get("v")), 0o644); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+	})
+	mux.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+		b, err := os.ReadFile(filepath.Join(dir, filepath.Base(r.URL.Query().Get("file"))))
+		if err != nil {
+			http.Error(w, "none", 404)
+			return
+		}
+		fmt.Fprint(w, string(b))
 	})
 	mux.HandleFunc("/sleep", func(w http.ResponseWriter, r *http.Request) {
 		d, _ := time.ParseDuration(r.URL.Query().Get("d"))

@@ -14,8 +14,24 @@ func compose(s Spec) map[string]string {
 	for _, name := range sortedRoles(c) {
 		r := c.Roles[name]
 		fmt.Fprintf(&b, "  %s:\n    image: %s\n    restart: unless-stopped\n    env_file: .env\n", name, q(image(s)))
-		if name == "web" {
-			fmt.Fprintf(&b, "    environment:\n      PORT: %q\n", fmt.Sprint(webPort(c)))
+		if env := plainEnv(c); name == "web" || len(env) > 0 {
+			b.WriteString("    environment:\n")
+			for _, kv := range env {
+				fmt.Fprintf(&b, "      %s: %s\n", kv[0], q(kv[1]))
+			}
+			if name == "web" {
+				fmt.Fprintf(&b, "      PORT: %q\n", fmt.Sprint(webPort(c)))
+			}
+		}
+		if ms := mountsOf(r); len(ms) > 0 {
+			b.WriteString("    volumes:\n")
+			for _, m := range ms {
+				line := m.Name + ":" + m.Path
+				if m.RO {
+					line += ":ro"
+				}
+				fmt.Fprintf(&b, "      - %s\n", q(line))
+			}
 		}
 		if r.Cmd != "" {
 			b.WriteString("    command:\n")
@@ -54,7 +70,7 @@ func compose(s Spec) map[string]string {
 	if len(s.Domains) > 0 {
 		b.WriteString("  caddy:\n    image: caddy:2\n    restart: unless-stopped\n    ports:\n      - \"80:80\"\n      - \"443:443\"\n    volumes:\n      - ./Caddyfile:/etc/caddy/Caddyfile:ro\n      - caddy-data:/data\n    depends_on:\n      - web\n")
 	}
-	var vols []string
+	vols := volumeNames(c)
 	if c.Services.Postgres {
 		vols = append(vols, "postgres-data")
 	}

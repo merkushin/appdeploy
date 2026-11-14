@@ -106,3 +106,80 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 }
+
+func TestAllMistakesAreReportedAtOnce(t *testing.T) {
+	_, err := Parse([]byte("roles:\n  web:\n    memroy: 1G\n    memory: lots\n    stop_timeout: soon\nbogus: 1\n"))
+	if err == nil {
+		t.Fatal("accepted")
+	}
+	for _, want := range []string{"memroy", "invalid size", "invalid duration", "bogus"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q:\n%v", want, err)
+		}
+	}
+}
+
+func TestEnvIsValidated(t *testing.T) {
+	good, err := Parse([]byte("env:\n  BASE_URL: https://x.example\n  INVITE_ONLY: 1\n  RATIO: 0.5\n  FLAG: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if good.Env["INVITE_ONLY"] != "1" || good.Env["FLAG"] != "true" || good.Env["RATIO"] != "0.5" {
+		t.Errorf("scalars must arrive as written: %v", good.Env)
+	}
+	for name, src := range map[string]string{
+		"bad name":        "env:\n  1BAD: x\n",
+		"dash in name":    "env:\n  A-B: x\n",
+		"PORT":            "env:\n  PORT: 80\n",
+		"APPDEPLOY_ name": "env:\n  APPDEPLOY_RELEASE: 9\n",
+		"multi-line":      "env:\n  A: |\n    one\n    two\n",
+	} {
+		if _, err := Parse([]byte(src)); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	back, err := FromJSON(good.JSON())
+	if err != nil || back.Env["BASE_URL"] != "https://x.example" {
+		t.Errorf("env does not survive the release's JSON: %v %v", back, err)
+	}
+}
+
+func TestVolumesAreNamedAndSafe(t *testing.T) {
+	ok, err := Parse([]byte("roles:\n  web:\n    volumes: [\"data:/data\", \"cache:/var/cache:ro\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ok.Roles["web"].Volumes) != 2 {
+		t.Errorf("volumes: %v", ok.Roles["web"].Volumes)
+	}
+	for name, vol := range map[string]string{
+		"a host path": "/srv/data:/data", "a relative path": "./data:/data", "no mount path": "data",
+		"a relative mount": "data:data", "mount at root": "data:/", "unclean path": "data:/a/../b",
+		"proc": "data:/proc/x", "uppercase name": "Data:/data", "unknown option": "data:/data:rw", "too many parts": "a:/b:ro:c",
+	} {
+		if _, err := Parse([]byte("roles:\n  web:\n    volumes: [\"" + vol + "\"]\n")); err == nil {
+			t.Errorf("%s (%s) was accepted", name, vol)
+		}
+	}
+	if _, err := Parse([]byte("roles:\n  web:\n    volumes: [\"a:/data\", \"b:/data\"]\n")); err == nil {
+		t.Errorf("two volumes at one path were accepted")
+	}
+}
+
+func TestWarnings(t *testing.T) {
+	c, err := Parse([]byte("env:\n  SMTP_PASSWORD: x\n  API_KEY: y\n  SESSION_KEY: z\n  BASE_URL: u\n  KEYBOARD: k\nroles:\n  web:\n    replicas_per_server: 2\n    volumes: [\"d:/d\"]\n  ro:\n    replicas_per_server: 2\n    volumes: [\"d:/d:ro\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := strings.Join(c.Warnings(), "\n")
+	for _, want := range []string{"env.SMTP_PASSWORD", "env.API_KEY", "env.SESSION_KEY", "roles.web: 2 replicas"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("no warning containing %q:\n%s", want, w)
+		}
+	}
+	for _, not := range []string{"BASE_URL", "KEYBOARD", "roles.ro"} {
+		if strings.Contains(w, not) {
+			t.Errorf("an unwarranted warning about %q:\n%s", not, w)
+		}
+	}
+}
