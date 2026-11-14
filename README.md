@@ -46,6 +46,8 @@ appdeploy logs <app> [--role web] [-f]
 appdeploy exec <app> -- <cmd...>
 appdeploy secrets set|unset|list|export <app> ...
 appdeploy db backup|list|restore <app>
+appdeploy deploy <app> --image REGISTRY/IMAGE:TAG     deploy an image built elsewhere
+appdeploy export <app> --format kamal|compose|k8s|fly   leave: the same setup for another tool
 appdeploy domains set <app> <domain>...
 ```
 

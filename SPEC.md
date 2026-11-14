@@ -494,7 +494,7 @@ services and backups; webhook notifications; disk cleanup.
 `join`, mTLS, labels and roles; image distribution; waves and canary; `--resume`;
 catching-up servers; health endpoint for external load balancers; `builder` server.
 
-**M4 — exit and convenience**
+**M4 — exit and convenience** (export, `--image` and access roles implemented, see §26)
 `export` to all formats; `--image` from CI; `self-update`; access roles; migration linter.
 
 ### M1 acceptance criteria
@@ -584,7 +584,7 @@ window restarts).
 `deploy.rolled_back` and `migration.suspect` as JSON. Slack incoming webhooks and the
 Telegram Bot API get `{"text": ...}`. Delivery is asynchronous with 2 retries; 4xx
 answers are not retried; webhook URLs are never written to logs (they carry secrets).
-`app.crashed`, `disk.low` and `backup.failed` are not implemented.
+`backup.failed` is sent by the backup schedule; `app.crashed` and `disk.low` by the monitor (§26).
 
 **Disk cleanup (§11).** After a successful deploy (and only while no build runs) dangling
 images of this agent's builds are pruned. `--prune-build-cache 168h` additionally drops
@@ -618,8 +618,7 @@ Gaps: no S3-compatible upload (backups live on the server's disk, so a lost serv
 them: copy `/var/lib/appdeploy/backups` elsewhere), no Postgres replication, service
 containers are not counted in the memory check, `apps destroy` keeps the app's database
 and role, services are reachable only from this server (a private network for multi-server
-groups is M3), service images are not upgraded by appdeploy, and `app.crashed` and
-`disk.low` notifications are not implemented.
+groups is M3), service images are not upgraded by appdeploy.
 
 **Testing hooks.** `APPDEPLOY_FAILPOINT=switch:before|switch:after-db|switch:after-proxy|observe:start`
 makes the agent SIGKILL itself at that point of the traffic switch or observation. It exists only so the
@@ -658,7 +657,7 @@ e2e tests can crash the agent at exact moments.
   already serves does nothing. If the coordinator dies mid-rollout, its restart runs the
   deploy again from the start (the build is mostly cached) and the servers that finished
   answer "already serving"; this stands in for `deploy --resume`.
-- `appdeploy` containers get `APPDEPLOY_SERVER` (the server's name) in their environment.
+- Containers get `APPDEPLOY_SERVER` (the server's name) in their environment.
 - `--health-listen :7071` serves `GET /health/<app>`: 200 when the server runs a web
   container of the live release, 503 otherwise and while a deploy is in `switching` on
   this server (a moment: the proxy is being changed), with no authentication.
@@ -699,3 +698,50 @@ and apps are created on the other servers by their first deploy; access to the p
 is all-or-nothing for any member; the git repository of an app lives only on the server
 that was pushed to, so push to the same server each time (a different server needs its own
 `apps create`).
+
+## 26. M4 implementation status
+
+**Export (§18), covered by unit tests and an e2e test.** `appdeploy export <app> --format
+kamal|compose|k8s|fly [--out dir]` renders the live release:
+
+- `kamal`: `config/deploy.yml` (roles with the group's server addresses by label, proxy with
+  the domains, health path and port, secret names, Postgres/Redis as accessories) and
+  `.kamal/secrets` (references such as `NAME=$NAME`);
+- `compose`: `compose.yml` (a service per role, memory and CPU limits, Postgres/Redis, and
+  Caddy with a generated `Caddyfile` when there are domains) and `.env.example`;
+- `k8s`: one file with a Secret template, a Deployment per role (replicas = replicas per
+  server x servers, readiness probe, limits), a Service and an Ingress;
+- `fly`: `fly.toml` (processes, health check, VM size) and `secrets.sh`.
+
+Only the names of secrets are written, never values; the e2e test sets a secret and checks
+that no format contains it. The compose file is validated with `docker compose config`.
+Images stay on the servers, so the files point at `your-registry.example.com/<app>:v<N>`:
+push the image there first. Data in Postgres moves with `db backup` / `pg_restore`.
+
+**Roles for SSH keys (§19).** `appdeploy shell --role viewer|deployer|admin` in the key's
+`command=` in `authorized_keys` (the install script writes it: `--ssh-key` admin,
+`--deployer-key`, `--viewer-key`). A viewer sees `status`, `releases`, `apps list`,
+`group servers`; a deployer adds `git push`/fetch, `deploy`, `redeploy`, `rollback`, `logs`
+and `secrets list`; an admin does everything, including `exec`, secrets, apps, domains,
+database backup and restore, export and group changes. No role means admin, so installs
+made before roles keep working. Roles apply to the SSH entry point; whoever can reach the
+agent's unix socket as root or the socket group still has full control. Peer-to-peer
+access in a group remains all-or-nothing.
+
+**Prebuilt images.** `appdeploy deploy <app> --image REF [--config appdeploy.yml]` skips the
+build: the image is used from this server's Docker if present, otherwise pulled (use
+`docker login` on the server for private registries), and the release then follows the usual
+path: release command, start, verify, switch, observe, rollback. The config is the file given
+with `--config`, else that of the live release, else the defaults. It is a normal release
+with its own number, and works in a group (the image is distributed like a built one).
+
+**Alerts.** The agent looks every `--monitor-every` (default 30s) at the containers of live
+releases and sends `app.crashed` when one was restarted by Docker, is not running, or is
+restarting repeatedly (once per incident, at most every 10 minutes per container; apps being
+deployed are skipped), and `disk.low` when free space on the data disk falls below the
+build thresholds (5 GiB or 10%), once until it recovers by 20%. Both go to the global
+webhooks and to the app's `notify:` list.
+
+**Not done:** `self-update` (needs a place to publish signed releases), the migration
+linter, uploading backups to S3-compatible storage, a cgroup memory limit for builds, and
+services for apps whose roles run on several servers.
